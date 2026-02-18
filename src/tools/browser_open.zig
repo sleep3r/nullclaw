@@ -103,12 +103,14 @@ pub const BrowserOpenTool = struct {
             return ToolResult.fail("Failed to wait for browser command");
         };
 
-        if (term.Exited == 0) {
-            const msg = try std.fmt.allocPrint(allocator, "Opened in browser: {s}", .{url});
-            return ToolResult{ .success = true, .output = msg };
-        } else {
-            return ToolResult.fail("Browser command failed");
+        switch (term) {
+            .Exited => |code| if (code == 0) {
+                const msg = try std.fmt.allocPrint(allocator, "Opened in browser: {s}", .{url});
+                return ToolResult{ .success = true, .output = msg };
+            },
+            else => {},
         }
+        return ToolResult.fail("Browser command failed");
     }
 };
 

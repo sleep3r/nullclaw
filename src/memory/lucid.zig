@@ -162,9 +162,15 @@ pub const LucidMemory = struct {
             return null;
         };
 
-        if (term != .Exited or term.Exited != 0) {
-            self.allocator.free(stdout_raw);
-            return null;
+        switch (term) {
+            .Exited => |code| if (code != 0) {
+                self.allocator.free(stdout_raw);
+                return null;
+            },
+            else => {
+                self.allocator.free(stdout_raw);
+                return null;
+            },
         }
 
         return stdout_raw;

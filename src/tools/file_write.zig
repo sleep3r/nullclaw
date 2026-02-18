@@ -2,6 +2,7 @@ const std = @import("std");
 const Tool = @import("root.zig").Tool;
 const ToolResult = @import("root.zig").ToolResult;
 const parseStringField = @import("shell.zig").parseStringField;
+const isPathSafe = @import("file_edit.zig").isPathSafe;
 
 /// Write file contents with workspace path scoping.
 pub const FileWriteTool = struct {
@@ -102,17 +103,6 @@ pub const FileWriteTool = struct {
         return ToolResult{ .success = true, .output = msg };
     }
 };
-
-/// Check if a relative path is safe (no traversal, no absolute path).
-fn isPathSafe(path: []const u8) bool {
-    if (path.len > 0 and path[0] == '/') return false;
-    if (std.mem.indexOfScalar(u8, path, 0) != null) return false;
-    var iter = std.mem.splitScalar(u8, path, '/');
-    while (iter.next()) |component| {
-        if (std.mem.eql(u8, component, "..")) return false;
-    }
-    return true;
-}
 
 // ── Tests ───────────────────────────────────────────────────────────
 

@@ -53,7 +53,10 @@ pub fn curlPost(allocator: Allocator, url: []const u8, body: []const u8, headers
     const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch return error.CurlReadError;
 
     const term = child.wait() catch return error.CurlWaitError;
-    if (term != .Exited or term.Exited != 0) return error.CurlFailed;
+    switch (term) {
+        .Exited => |code| if (code != 0) return error.CurlFailed,
+        else => return error.CurlFailed,
+    }
 
     return stdout;
 }
@@ -100,9 +103,15 @@ pub fn curlGet(allocator: Allocator, url: []const u8, headers: []const []const u
     const stdout = child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024) catch return error.CurlReadError;
 
     const term = child.wait() catch return error.CurlWaitError;
-    if (term != .Exited or term.Exited != 0) {
-        allocator.free(stdout);
-        return error.CurlFailed;
+    switch (term) {
+        .Exited => |code| if (code != 0) {
+            allocator.free(stdout);
+            return error.CurlFailed;
+        },
+        else => {
+            allocator.free(stdout);
+            return error.CurlFailed;
+        },
     }
 
     return stdout;

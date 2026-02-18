@@ -230,12 +230,12 @@ pub fn isNativeJsonFormat(text: []const u8) bool {
 
 /// Detect whether a response string is in OpenAI native tool-call format.
 /// Looks for the `"tool_calls"` key inside a top-level JSON object.
-pub fn isNativeFormat(response: []const u8) bool {
+pub fn isNativeFormat(allocator: std.mem.Allocator, response: []const u8) bool {
     // Quick heuristic: must contain "tool_calls" substring
     if (std.mem.indexOf(u8, response, "\"tool_calls\"") == null) return false;
 
     // Validate it's inside a parseable JSON object
-    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, response, .{}) catch return false;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch return false;
     defer parsed.deinit();
 
     return switch (parsed.value) {
@@ -1017,21 +1017,21 @@ test "isNativeFormat detects OpenAI tool_calls" {
     const native_response =
         \\{"content":"ok","tool_calls":[{"id":"call_1","type":"function","function":{"name":"shell","arguments":"{\"command\":\"ls\"}"}}]}
     ;
-    try std.testing.expect(isNativeFormat(native_response));
+    try std.testing.expect(isNativeFormat(std.testing.allocator, native_response));
 }
 
 test "isNativeFormat rejects XML format" {
     const xml_response = "Let me check.\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{}}\n</tool_call>";
-    try std.testing.expect(!isNativeFormat(xml_response));
+    try std.testing.expect(!isNativeFormat(std.testing.allocator, xml_response));
 }
 
 test "isNativeFormat rejects plain text" {
-    try std.testing.expect(!isNativeFormat("Just a normal response."));
+    try std.testing.expect(!isNativeFormat(std.testing.allocator, "Just a normal response."));
 }
 
 test "isNativeFormat rejects tool_calls in non-JSON context" {
     // Contains the substring but is not valid JSON
-    try std.testing.expect(!isNativeFormat("The API returns \"tool_calls\" in the response."));
+    try std.testing.expect(!isNativeFormat(std.testing.allocator, "The API returns \"tool_calls\" in the response."));
 }
 
 test "parseNativeToolCalls single call" {

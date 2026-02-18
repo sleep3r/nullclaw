@@ -5,6 +5,7 @@ const parseStringField = @import("shell.zig").parseStringField;
 const parseBoolField = @import("shell.zig").parseBoolField;
 const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
+const loadScheduler = @import("cron_add.zig").loadScheduler;
 
 /// CronUpdate tool — update a cron job's expression, command, or enabled state.
 pub const CronUpdateTool = struct {
@@ -39,12 +40,6 @@ pub const CronUpdateTool = struct {
         return 
         \\{"type":"object","properties":{"job_id":{"type":"string","description":"ID of the cron job to update"},"expression":{"type":"string","description":"New cron expression"},"command":{"type":"string","description":"New command to execute"},"enabled":{"type":"boolean","description":"Enable or disable the job"}},"required":["job_id"]}
         ;
-    }
-
-    fn loadScheduler(allocator: std.mem.Allocator) !CronScheduler {
-        var scheduler = CronScheduler.init(allocator, 1024, true);
-        cron.loadJobs(&scheduler) catch {};
-        return scheduler;
     }
 
     fn execute(_: *CronUpdateTool, allocator: std.mem.Allocator, args_json: []const u8) !ToolResult {

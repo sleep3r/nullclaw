@@ -162,7 +162,11 @@ pub const GitTool = struct {
         const stderr = try child.stderr.?.readToEndAlloc(allocator, 1_048_576);
         const term = try child.wait();
 
-        return .{ .stdout = stdout, .stderr = stderr, .success = term.Exited == 0 };
+        const success = switch (term) {
+            .Exited => |code| code == 0,
+            else => false,
+        };
+        return .{ .stdout = stdout, .stderr = stderr, .success = success };
     }
 
     fn gitStatus(self: *GitTool, allocator: std.mem.Allocator) !ToolResult {

@@ -354,10 +354,10 @@ pub const OneBotChannel = struct {
         try url_fbs.writer().print("{s}/send_msg", .{api_base});
         const url = url_fbs.getWritten();
 
-        // Build JSON body
-        var body_buf: [8192]u8 = undefined;
-        var body_fbs = std.io.fixedBufferStream(&body_buf);
-        const bw = body_fbs.writer();
+        // Build JSON body dynamically
+        var body_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_list.deinit(self.allocator);
+        const bw = body_list.writer(self.allocator);
         try bw.writeAll("{\"action\":\"send_msg\",\"params\":{");
         try bw.print("\"message_type\":\"{s}\",", .{msg_type});
         if (std.mem.eql(u8, msg_type, "group")) {
@@ -368,7 +368,7 @@ pub const OneBotChannel = struct {
         try bw.writeAll("\"message\":");
         try root.appendJsonStringW(bw, text);
         try bw.writeAll("}}");
-        const body = body_fbs.getWritten();
+        const body = body_list.items;
 
         // Build headers
         var headers_buf: [1][]const u8 = undefined;

@@ -98,8 +98,8 @@ pub const SchemaCleanr = struct {
     }
 
     /// Validate that a schema has a "type" field.
-    pub fn validate(schema_json: []const u8) bool {
-        const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, schema_json, .{}) catch return false;
+    pub fn validate(allocator: std.mem.Allocator, schema_json: []const u8) bool {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, schema_json, .{}) catch return false;
         defer parsed.deinit();
         const root = parsed.value;
         if (root != .object) return false;
@@ -120,7 +120,7 @@ pub const SchemaCleanr = struct {
         const root = parsed.value;
 
         // Extract $defs for reference resolution
-        var defs = extractDefs(root);
+        var defs = extractDefs(arena_alloc, root);
 
         // Track visited refs for circular detection
         var ref_stack = std.StringHashMap(void).init(arena_alloc);
@@ -155,11 +155,10 @@ fn isUnsupported(keyword: []const u8, strategy: CleaningStrategy) bool {
 }
 
 /// Extract `$defs` and `definitions` from a root schema value.
-fn extractDefs(root: std.json.Value) std.json.ObjectMap {
+fn extractDefs(allocator: std.mem.Allocator, root: std.json.Value) std.json.ObjectMap {
     if (root != .object) {
-        // Return an empty map from the parsed arena — won't be used, just need a valid value.
-        // We use the object map from a dummy. Caller handles the empty case.
-        return std.json.ObjectMap.init(std.heap.page_allocator);
+        // Return an empty map — won't be used, just need a valid value.
+        return std.json.ObjectMap.init(allocator);
     }
     const obj = root.object;
 
@@ -170,7 +169,7 @@ fn extractDefs(root: std.json.Value) std.json.ObjectMap {
     if (obj.get("definitions")) |v| {
         if (v == .object) return v.object;
     }
-    return std.json.ObjectMap.init(std.heap.page_allocator);
+    return std.json.ObjectMap.init(allocator);
 }
 
 const CleanError = std.mem.Allocator.Error;
@@ -188,7 +187,7 @@ fn cleanValue(
         .array => |arr| {
             var result = blk: {
                 var a = std.json.Array.init(allocator);
-                a.ensureTotalCapacity(arr.items.len) catch unreachable;
+                try a.ensureTotalCapacity(arr.items.len);
                 break :blk a;
             };
             for (arr.items) |item| {
@@ -603,14 +602,14 @@ test "schema validate with type returns true" {
     const input =
         \\{"type":"object","properties":{"a":{"type":"string"}}}
     ;
-    try std.testing.expect(SchemaCleanr.validate(input));
+    try std.testing.expect(SchemaCleanr.validate(std.testing.allocator, input));
 }
 
 test "schema validate without type returns false" {
     const input =
         \\{"properties":{"a":{"type":"string"}}}
     ;
-    try std.testing.expect(!SchemaCleanr.validate(input));
+    try std.testing.expect(!SchemaCleanr.validate(std.testing.allocator, input));
 }
 
 test "schema anyOf simplification strips null" {
@@ -693,11 +692,11 @@ test "schema type array null removal" {
 }
 
 test "schema validate rejects non-object" {
-    try std.testing.expect(!SchemaCleanr.validate("\"just a string\""));
-    try std.testing.expect(!SchemaCleanr.validate("42"));
-    try std.testing.expect(!SchemaCleanr.validate("null"));
+    try std.testing.expect(!SchemaCleanr.validate(std.testing.allocator, "\"just a string\""));
+    try std.testing.expect(!SchemaCleanr.validate(std.testing.allocator, "42"));
+    try std.testing.expect(!SchemaCleanr.validate(std.testing.allocator, "null"));
 }
 
 test "schema validate rejects invalid json" {
-    try std.testing.expect(!SchemaCleanr.validate("{bad json}"));
+    try std.testing.expect(!SchemaCleanr.validate(std.testing.allocator, "{bad json}"));
 }

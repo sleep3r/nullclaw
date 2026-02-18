@@ -43,18 +43,26 @@ pub const spi = @import("spi.zig");
 
 // ── Core types ──────────────────────────────────────────────────────
 
-/// Result of a tool execution
+/// Result of a tool execution.
+///
+/// Ownership: both `output` and `error_msg` are owned by the tool that produced them.
+/// The caller (agent/dispatcher) must free them with `allocator.free()` after use.
+/// Exception: static string literals (e.g. `""`, compile-time constants) must NOT be freed —
+/// use `ToolResult.ok("")` or `ToolResult.fail("literal")` for those.
 pub const ToolResult = struct {
     success: bool,
+    /// Heap-allocated output string owned by caller. Free with allocator.free().
+    /// May be an empty literal "" for void results — do NOT free in that case.
     output: []const u8,
+    /// Heap-allocated error message owned by caller if non-null. Free with allocator.free().
     error_msg: ?[]const u8 = null,
 
-    /// Create a success result
+    /// Create a success result with a static/literal output (do NOT free).
     pub fn ok(output: []const u8) ToolResult {
         return .{ .success = true, .output = output };
     }
 
-    /// Create a failure result
+    /// Create a failure result with a static/literal error message (do NOT free).
     pub fn fail(err: []const u8) ToolResult {
         return .{ .success = false, .output = "", .error_msg = err };
     }
@@ -104,6 +112,17 @@ pub const Tool = struct {
         };
     }
 };
+
+/// Comptime check that a type correctly implements the Tool interface.
+pub fn assertToolInterface(comptime T: type) void {
+    if (!@hasDecl(T, "tool")) @compileError(@typeName(T) ++ " missing tool() method");
+    if (!@hasDecl(T, "vtable")) @compileError(@typeName(T) ++ " missing vtable constant");
+    const vt = T.vtable;
+    _ = vt.execute;
+    _ = vt.name;
+    _ = vt.description;
+    _ = vt.parameters_json;
+}
 
 /// Create the default tool set (shell, file_read, file_write).
 pub fn defaultTools(

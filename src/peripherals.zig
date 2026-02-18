@@ -264,6 +264,7 @@ pub const SerialPeripheral = struct {
 
 /// Arduino peripheral: detect boards via serial, upload sketches via arduino-cli.
 pub const ArduinoPeripheral = struct {
+    allocator: std.mem.Allocator,
     peripheral_name: []const u8,
     port_path: []const u8,
     baud_rate: u32,
@@ -283,8 +284,9 @@ pub const ArduinoPeripheral = struct {
         .capabilities = arduinoCapabilities,
     };
 
-    pub fn create(port_path: []const u8, baud: u32) ArduinoPeripheral {
+    pub fn create(allocator: std.mem.Allocator, port_path: []const u8, baud: u32) ArduinoPeripheral {
         return .{
+            .allocator = allocator,
             .peripheral_name = "arduino-uno",
             .port_path = port_path,
             .baud_rate = baud,
@@ -316,10 +318,11 @@ pub const ArduinoPeripheral = struct {
 
     fn arduinoInit(ptr: *anyopaque) Peripheral.PeripheralError!void {
         const self = resolve(ptr);
+        const allocator = self.allocator;
         // Detect Arduino by running arduino-cli board list and checking for the port.
         var child = std.process.Child.init(
             &.{ "arduino-cli", "board", "list" },
-            std.heap.page_allocator,
+            allocator,
         );
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Ignore;
@@ -328,8 +331,8 @@ pub const ArduinoPeripheral = struct {
             return Peripheral.PeripheralError.DeviceNotFound;
         };
         // Read stdout to check if our port is listed
-        const stdout = if (child.stdout) |*out| out.readToEndAlloc(std.heap.page_allocator, 64 * 1024) catch null else null;
-        defer if (stdout) |s| std.heap.page_allocator.free(s);
+        const stdout = if (child.stdout) |*out| out.readToEndAlloc(allocator, 64 * 1024) catch null else null;
+        defer if (stdout) |s| allocator.free(s);
         const term = child.wait() catch {
             self.connected = false;
             return Peripheral.PeripheralError.DeviceNotFound;
@@ -417,18 +420,19 @@ pub const ArduinoPeripheral = struct {
         const self = resolve(ptr);
         if (!self.connected) return Peripheral.PeripheralError.NotConnected;
         if (firmware_path.len == 0) return Peripheral.PeripheralError.FlashFailed;
+        const allocator = self.allocator;
 
         // Step 1: Compile the sketch
         var compile_child = std.process.Child.init(
             &.{ "arduino-cli", "compile", "--fqbn", self.fqbn, firmware_path },
-            std.heap.page_allocator,
+            allocator,
         );
         compile_child.stdout_behavior = .Ignore;
         compile_child.stderr_behavior = .Pipe;
         compile_child.spawn() catch return Peripheral.PeripheralError.FlashFailed;
         // Drain stderr to avoid pipe deadlock
         if (compile_child.stderr) |*err_pipe| {
-            _ = err_pipe.readToEndAlloc(std.heap.page_allocator, 64 * 1024) catch {};
+            _ = err_pipe.readToEndAlloc(allocator, 64 * 1024) catch {};
         }
         const compile_term = compile_child.wait() catch return Peripheral.PeripheralError.FlashFailed;
         const compile_ok = switch (compile_term) {
@@ -440,13 +444,13 @@ pub const ArduinoPeripheral = struct {
         // Step 2: Upload to the board
         var upload_child = std.process.Child.init(
             &.{ "arduino-cli", "upload", "-p", self.port_path, "--fqbn", self.fqbn, firmware_path },
-            std.heap.page_allocator,
+            allocator,
         );
         upload_child.stdout_behavior = .Ignore;
         upload_child.stderr_behavior = .Pipe;
         upload_child.spawn() catch return Peripheral.PeripheralError.FlashFailed;
         if (upload_child.stderr) |*err_pipe| {
-            _ = err_pipe.readToEndAlloc(std.heap.page_allocator, 64 * 1024) catch {};
+            _ = err_pipe.readToEndAlloc(allocator, 64 * 1024) catch {};
         }
         const upload_term = upload_child.wait() catch return Peripheral.PeripheralError.FlashFailed;
         const upload_ok = switch (upload_term) {
@@ -469,10 +473,10 @@ pub const ArduinoPeripheral = struct {
     }
 
     /// Check if arduino-cli is available on the system.
-    pub fn isArduinoCliAvailable() bool {
+    pub fn isArduinoCliAvailable(allocator: std.mem.Allocator) bool {
         var child = std.process.Child.init(
             &.{ "arduino-cli", "version" },
-            std.heap.page_allocator,
+            allocator,
         );
         child.stdout_behavior = .Ignore;
         child.stderr_behavior = .Ignore;
@@ -644,6 +648,7 @@ pub const RpiGpioPeripheral = struct {
 
 /// STM32 Nucleo board flash utility via probe-rs.
 pub const NucleoFlash = struct {
+    allocator: std.mem.Allocator,
     chip: []const u8,
     target: []const u8,
     connected: bool = false,
@@ -659,19 +664,20 @@ pub const NucleoFlash = struct {
         .capabilities = nucleoCapabilities,
     };
 
-    pub fn create(chip: []const u8) NucleoFlash {
+    pub fn create(allocator: std.mem.Allocator, chip: []const u8) NucleoFlash {
         return .{
+            .allocator = allocator,
             .chip = chip,
             .target = "thumbv7em-none-eabihf",
         };
     }
 
-    pub fn createF401() NucleoFlash {
-        return create("STM32F401RETx");
+    pub fn createF401(allocator: std.mem.Allocator) NucleoFlash {
+        return create(allocator, "STM32F401RETx");
     }
 
-    pub fn createF411() NucleoFlash {
-        return create("STM32F411RETx");
+    pub fn createF411(allocator: std.mem.Allocator) NucleoFlash {
+        return create(allocator, "STM32F411RETx");
     }
 
     pub fn peripheral(self: *NucleoFlash) Peripheral {
@@ -699,10 +705,11 @@ pub const NucleoFlash = struct {
 
     fn nucleoInit(ptr: *anyopaque) Peripheral.PeripheralError!void {
         const self = resolve(ptr);
+        const allocator = self.allocator;
         // Verify a debug probe is connected via probe-rs list
         var child = std.process.Child.init(
             &.{ "probe-rs", "list" },
-            std.heap.page_allocator,
+            allocator,
         );
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Ignore;
@@ -710,8 +717,8 @@ pub const NucleoFlash = struct {
             self.connected = false;
             return Peripheral.PeripheralError.NotConnected;
         };
-        const stdout = if (child.stdout) |*out| out.readToEndAlloc(std.heap.page_allocator, 64 * 1024) catch null else null;
-        defer if (stdout) |s| std.heap.page_allocator.free(s);
+        const stdout = if (child.stdout) |*out| out.readToEndAlloc(allocator, 64 * 1024) catch null else null;
+        defer if (stdout) |s| allocator.free(s);
         const term = child.wait() catch {
             self.connected = false;
             return Peripheral.PeripheralError.NotConnected;
@@ -741,6 +748,7 @@ pub const NucleoFlash = struct {
     fn nucleoRead(ptr: *anyopaque, addr: u32) Peripheral.PeripheralError!u8 {
         const self = resolve(ptr);
         if (!self.connected) return Peripheral.PeripheralError.NotConnected;
+        const allocator = self.allocator;
 
         // Format address as hex string for probe-rs
         var addr_buf: [16]u8 = undefined;
@@ -750,13 +758,13 @@ pub const NucleoFlash = struct {
         // Run: probe-rs read b8 <addr> --chip CHIP
         var child = std.process.Child.init(
             &.{ "probe-rs", "read", "b8", addr_hex, "--chip", self.chip },
-            std.heap.page_allocator,
+            allocator,
         );
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Ignore;
         child.spawn() catch return Peripheral.PeripheralError.IoError;
-        const stdout = if (child.stdout) |*out| out.readToEndAlloc(std.heap.page_allocator, 4096) catch null else null;
-        defer if (stdout) |s| std.heap.page_allocator.free(s);
+        const stdout = if (child.stdout) |*out| out.readToEndAlloc(allocator, 4096) catch null else null;
+        defer if (stdout) |s| allocator.free(s);
         const term = child.wait() catch return Peripheral.PeripheralError.IoError;
         const exited_ok = switch (term) {
             .Exited => |code| code == 0,
@@ -786,14 +794,14 @@ pub const NucleoFlash = struct {
         // Run: probe-rs write b8 <addr> <data> --chip CHIP
         var child = std.process.Child.init(
             &.{ "probe-rs", "write", "b8", addr_hex, data_str, "--chip", self.chip },
-            std.heap.page_allocator,
+            self.allocator,
         );
         child.stdout_behavior = .Ignore;
         child.stderr_behavior = .Pipe;
         child.spawn() catch return Peripheral.PeripheralError.IoError;
         // Drain stderr to avoid pipe deadlock
         if (child.stderr) |*err_pipe| {
-            _ = err_pipe.readToEndAlloc(std.heap.page_allocator, 64 * 1024) catch {};
+            _ = err_pipe.readToEndAlloc(self.allocator, 64 * 1024) catch {};
         }
         const term = child.wait() catch return Peripheral.PeripheralError.IoError;
         const exited_ok = switch (term) {
@@ -806,21 +814,22 @@ pub const NucleoFlash = struct {
     fn nucleoFlash(ptr: *anyopaque, firmware_path: []const u8) Peripheral.PeripheralError!void {
         const self = resolve(ptr);
         if (firmware_path.len == 0) return Peripheral.PeripheralError.FlashFailed;
+        const allocator = self.allocator;
 
         // Run: probe-rs run --chip CHIP firmware_path
         var child = std.process.Child.init(
             &.{ "probe-rs", "run", "--chip", self.chip, firmware_path },
-            std.heap.page_allocator,
+            allocator,
         );
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
         child.spawn() catch return Peripheral.PeripheralError.FlashFailed;
         // Drain pipes to avoid deadlock
         if (child.stdout) |*out| {
-            _ = out.readToEndAlloc(std.heap.page_allocator, 64 * 1024) catch {};
+            _ = out.readToEndAlloc(allocator, 64 * 1024) catch {};
         }
         if (child.stderr) |*err_pipe| {
-            _ = err_pipe.readToEndAlloc(std.heap.page_allocator, 64 * 1024) catch {};
+            _ = err_pipe.readToEndAlloc(allocator, 64 * 1024) catch {};
         }
         const term = child.wait() catch return Peripheral.PeripheralError.FlashFailed;
         const ok = switch (term) {
@@ -843,10 +852,10 @@ pub const NucleoFlash = struct {
     }
 
     /// Check if probe-rs is available on the system.
-    pub fn isProbeRsAvailable() bool {
+    pub fn isProbeRsAvailable(allocator: std.mem.Allocator) bool {
         var child = std.process.Child.init(
             &.{ "probe-rs", "--version" },
-            std.heap.page_allocator,
+            allocator,
         );
         child.stdout_behavior = .Ignore;
         child.stderr_behavior = .Ignore;
@@ -1235,7 +1244,7 @@ test "SerialPeripheral read fails when not connected" {
 }
 
 test "ArduinoPeripheral vtable works" {
-    var arduino = ArduinoPeripheral.create("/dev/cu.usbmodem0001", 115200);
+    var arduino = ArduinoPeripheral.create(std.testing.allocator, "/dev/cu.usbmodem0001", 115200);
     const p = arduino.peripheral();
     try std.testing.expectEqualStrings("arduino-uno", p.name());
     try std.testing.expectEqualStrings("arduino-uno", p.boardType());
@@ -1246,7 +1255,7 @@ test "ArduinoPeripheral vtable works" {
 }
 
 test "ArduinoPeripheral flash fails when not connected" {
-    var arduino = ArduinoPeripheral.create("/dev/cu.usbmodem0001", 115200);
+    var arduino = ArduinoPeripheral.create(std.testing.allocator, "/dev/cu.usbmodem0001", 115200);
     const p = arduino.peripheral();
     try std.testing.expectError(Peripheral.PeripheralError.NotConnected, p.flashFirmware("test.ino"));
 }
@@ -1288,7 +1297,7 @@ test "RpiGpioPeripheral.gpioStateString" {
 }
 
 test "NucleoFlash vtable works" {
-    var nucleo = NucleoFlash.createF401();
+    var nucleo = NucleoFlash.createF401(std.testing.allocator);
     const p = nucleo.peripheral();
     try std.testing.expectEqualStrings("STM32F401RETx", p.name());
     try std.testing.expectEqualStrings("nucleo", p.boardType());
@@ -1299,18 +1308,18 @@ test "NucleoFlash vtable works" {
 }
 
 test "NucleoFlash F411 creation" {
-    const nucleo = NucleoFlash.createF411();
+    const nucleo = NucleoFlash.createF411(std.testing.allocator);
     try std.testing.expectEqualStrings("STM32F411RETx", nucleo.chip);
 }
 
 test "NucleoFlash read fails when not connected" {
-    var nucleo = NucleoFlash.createF401();
+    var nucleo = NucleoFlash.createF401(std.testing.allocator);
     const p = nucleo.peripheral();
     try std.testing.expectError(Peripheral.PeripheralError.NotConnected, p.read(0));
 }
 
 test "NucleoFlash flash with empty path fails" {
-    var nucleo = NucleoFlash.createF401();
+    var nucleo = NucleoFlash.createF401(std.testing.allocator);
     nucleo.connected = true;
     const p = nucleo.peripheral();
     try std.testing.expectError(Peripheral.PeripheralError.FlashFailed, p.flashFirmware(""));

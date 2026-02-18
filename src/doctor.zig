@@ -308,7 +308,10 @@ fn getDiskAvailableMb(allocator: std.mem.Allocator, path: []const u8) !?u64 {
     }) catch return null;
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
-    if (result.term.Exited != 0) return null;
+    switch (result.term) {
+        .Exited => |code| if (code != 0) return null,
+        else => return null,
+    }
     return parseDfAvailableMb(result.stdout);
 }
 
@@ -521,7 +524,10 @@ fn checkCommandAvailable(allocator: std.mem.Allocator, cmd: []const u8) !?[]cons
     }) catch return null;
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
-    if (result.term.Exited != 0) return null;
+    switch (result.term) {
+        .Exited => |code| if (code != 0) return null,
+        else => return null,
+    }
 
     // Take first line, trimmed
     const trimmed = std.mem.trim(u8, result.stdout, " \n\r\t");

@@ -46,16 +46,16 @@ pub const LineChannel = struct {
 
     /// Reply to a message using the replyToken (valid for ~30s after event).
     pub fn replyMessage(self: *LineChannel, reply_token: []const u8, text: []const u8) !void {
-        var body_buf: [8192]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&body_buf);
-        const w = fbs.writer();
+        var body_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_list.deinit(self.allocator);
+        const w = body_list.writer(self.allocator);
 
         try w.writeAll("{\"replyToken\":\"");
         try w.writeAll(reply_token);
         try w.writeAll("\",\"messages\":[{\"type\":\"text\",\"text\":");
         try root.appendJsonStringW(w, text);
         try w.writeAll("}]}");
-        const body = fbs.getWritten();
+        const body = body_list.items;
 
         var auth_buf: [512]u8 = undefined;
         var auth_fbs = std.io.fixedBufferStream(&auth_buf);
@@ -71,16 +71,16 @@ pub const LineChannel = struct {
 
     /// Push a message to a user by userId (no replyToken needed).
     pub fn pushMessage(self: *LineChannel, user_id: []const u8, text: []const u8) !void {
-        var body_buf: [8192]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&body_buf);
-        const w = fbs.writer();
+        var body_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_list.deinit(self.allocator);
+        const w = body_list.writer(self.allocator);
 
         try w.writeAll("{\"to\":\"");
         try w.writeAll(user_id);
         try w.writeAll("\",\"messages\":[{\"type\":\"text\",\"text\":");
         try root.appendJsonStringW(w, text);
         try w.writeAll("}]}");
-        const body = fbs.getWritten();
+        const body = body_list.items;
 
         var auth_buf: [512]u8 = undefined;
         var auth_fbs = std.io.fixedBufferStream(&auth_buf);

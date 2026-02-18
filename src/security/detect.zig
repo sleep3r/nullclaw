@@ -23,6 +23,7 @@ pub const SandboxBackend = enum {
 /// Priority on macOS: docker > noop
 /// Explicit backend selection overrides auto-detection.
 pub fn createSandbox(
+    allocator: std.mem.Allocator,
     backend: SandboxBackend,
     workspace_dir: []const u8,
     /// Caller-provided storage for sandbox backend structs.
@@ -59,11 +60,11 @@ pub fn createSandbox(
             return storage.noop.sandbox();
         },
         .docker => {
-            storage.docker = .{ .workspace_dir = workspace_dir, .image = DockerSandbox.default_image };
+            storage.docker = .{ .allocator = allocator, .workspace_dir = workspace_dir, .image = DockerSandbox.default_image };
             return storage.docker.sandbox();
         },
         .auto => {
-            return detectBest(workspace_dir, storage);
+            return detectBest(allocator, workspace_dir, storage);
         },
     }
 }
@@ -74,11 +75,11 @@ pub const SandboxStorage = struct {
     landlock: LandlockSandbox = .{ .workspace_dir = "" },
     firejail: FirejailSandbox = .{ .workspace_dir = "" },
     bubblewrap: BubblewrapSandbox = .{ .workspace_dir = "" },
-    docker: DockerSandbox = .{ .workspace_dir = "", .image = DockerSandbox.default_image },
+    docker: DockerSandbox = .{ .allocator = undefined, .workspace_dir = "", .image = DockerSandbox.default_image },
 };
 
 /// Auto-detect the best available sandbox backend.
-fn detectBest(workspace_dir: []const u8, storage: *SandboxStorage) Sandbox {
+fn detectBest(allocator: std.mem.Allocator, workspace_dir: []const u8, storage: *SandboxStorage) Sandbox {
     if (comptime builtin.os.tag == .linux) {
         // Try Landlock first (native, no external dependencies)
         storage.landlock = .{ .workspace_dir = workspace_dir };
@@ -100,7 +101,7 @@ fn detectBest(workspace_dir: []const u8, storage: *SandboxStorage) Sandbox {
     }
 
     // Docker works on any platform if installed
-    storage.docker = .{ .workspace_dir = workspace_dir, .image = DockerSandbox.default_image };
+    storage.docker = .{ .allocator = allocator, .workspace_dir = workspace_dir, .image = DockerSandbox.default_image };
     if (storage.docker.sandbox().isAvailable()) {
         return storage.docker.sandbox();
     }
@@ -119,7 +120,7 @@ pub const AvailableBackends = struct {
     docker: bool,
 };
 
-pub fn detectAvailable(workspace_dir: []const u8) AvailableBackends {
+pub fn detectAvailable(allocator: std.mem.Allocator, workspace_dir: []const u8) AvailableBackends {
     var storage: SandboxStorage = .{};
 
     storage.landlock = .{ .workspace_dir = workspace_dir };
@@ -131,7 +132,7 @@ pub fn detectAvailable(workspace_dir: []const u8) AvailableBackends {
     storage.bubblewrap = .{ .workspace_dir = workspace_dir };
     const bw_avail = storage.bubblewrap.sandbox().isAvailable();
 
-    storage.docker = .{ .workspace_dir = workspace_dir, .image = DockerSandbox.default_image };
+    storage.docker = .{ .allocator = allocator, .workspace_dir = workspace_dir, .image = DockerSandbox.default_image };
     const dk_avail = storage.docker.sandbox().isAvailable();
 
     return .{
@@ -145,7 +146,7 @@ pub fn detectAvailable(workspace_dir: []const u8) AvailableBackends {
 // ── Tests ──────────────────────────────────────────────────────────────
 
 test "detect available returns struct" {
-    const avail = detectAvailable("/tmp/workspace");
+    const avail = detectAvailable(std.testing.allocator, "/tmp/workspace");
     // On macOS, landlock/firejail/bubblewrap should be false
     if (comptime builtin.os.tag != .linux) {
         try std.testing.expect(!avail.landlock);
@@ -158,21 +159,21 @@ test "detect available returns struct" {
 
 test "create sandbox with none returns noop" {
     var storage: SandboxStorage = .{};
-    const sb = createSandbox(.none, "/tmp/workspace", &storage);
+    const sb = createSandbox(std.testing.allocator, .none, "/tmp/workspace", &storage);
     try std.testing.expectEqualStrings("none", sb.name());
     try std.testing.expect(sb.isAvailable());
 }
 
 test "create sandbox with auto returns something" {
     var storage: SandboxStorage = .{};
-    const sb = createSandbox(.auto, "/tmp/workspace", &storage);
+    const sb = createSandbox(std.testing.allocator, .auto, "/tmp/workspace", &storage);
     // Should always return at least some sandbox
     try std.testing.expect(sb.name().len > 0);
 }
 
 test "create sandbox with docker returns docker" {
     var storage: SandboxStorage = .{};
-    const sb = createSandbox(.docker, "/tmp/workspace", &storage);
+    const sb = createSandbox(std.testing.allocator, .docker, "/tmp/workspace", &storage);
     try std.testing.expectEqualStrings("docker", sb.name());
 }
 

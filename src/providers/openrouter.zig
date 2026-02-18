@@ -390,9 +390,15 @@ fn curlGet(allocator: std.mem.Allocator, url: []const u8, auth_hdr: []const u8) 
     const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch return error.CurlReadError;
 
     const term = child.wait() catch return error.CurlWaitError;
-    if (term != .Exited or term.Exited != 0) {
-        allocator.free(stdout);
-        return error.CurlFailed;
+    switch (term) {
+        .Exited => |code| if (code != 0) {
+            allocator.free(stdout);
+            return error.CurlFailed;
+        },
+        else => {
+            allocator.free(stdout);
+            return error.CurlFailed;
+        },
     }
 
     return stdout;

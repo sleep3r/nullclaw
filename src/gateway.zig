@@ -613,6 +613,11 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
         var conn = server.accept() catch continue;
         defer conn.stream.close();
 
+        // Per-request arena — all request-scoped allocations freed in one shot
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const req_allocator = arena.allocator();
+
         // Read request line + headers from TCP stream
         var req_buf: [4096]u8 = undefined;
         const n = conn.stream.read(&req_buf) catch continue;
@@ -631,31 +636,19 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
         var response_status: []const u8 = "200 OK";
         var response_body: []const u8 = "";
 
-        // Track whether we allocated a dynamic response body
-        var dynamic_body: ?[]u8 = null;
-        defer if (dynamic_body) |db| state.allocator.free(db);
-
         if (std.mem.eql(u8, target, "/health") or std.mem.startsWith(u8, target, "/health?")) {
             response_body = if (isHealthOk()) "{\"status\":\"ok\"}" else "{\"status\":\"degraded\"}";
         } else if (std.mem.eql(u8, target, "/ready") or std.mem.startsWith(u8, target, "/ready?")) {
-            const readiness = health.checkRegistryReadiness(state.allocator) catch {
+            const readiness = health.checkRegistryReadiness(req_allocator) catch {
                 response_status = "500 Internal Server Error";
                 response_body = "{\"status\":\"not_ready\",\"checks\":[]}";
                 continue;
             };
-            // formatJson must run before freeing the checks slice
-            const json_body = readiness.formatJson(state.allocator) catch {
-                if (readiness.checks.len > 0) {
-                    state.allocator.free(readiness.checks);
-                }
+            const json_body = readiness.formatJson(req_allocator) catch {
                 response_status = "500 Internal Server Error";
                 response_body = "{\"status\":\"not_ready\",\"checks\":[]}";
                 continue;
             };
-            if (readiness.checks.len > 0) {
-                state.allocator.free(readiness.checks);
-            }
-            dynamic_body = @constCast(json_body);
             response_body = json_body;
             if (readiness.status != .ready) {
                 response_status = "503 Service Unavailable";
@@ -675,13 +668,9 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
                 const body = extractBody(raw);
                 if (body) |b| {
                     const msg_text = jsonStringField(b, "message") orelse jsonStringField(b, "text") orelse b;
-                    if (processIncomingMessage(state.allocator, msg_text)) |resp| {
-                        dynamic_body = resp;
-                        // Build JSON response
-                        const json_resp = std.fmt.allocPrint(state.allocator, "{{\"status\":\"ok\",\"response\":\"{s}\"}}", .{resp}) catch null;
+                    if (processIncomingMessage(req_allocator, msg_text)) |resp| {
+                        const json_resp = std.fmt.allocPrint(req_allocator, "{{\"status\":\"ok\",\"response\":\"{s}\"}}", .{resp}) catch null;
                         if (json_resp) |jr| {
-                            state.allocator.free(resp);
-                            dynamic_body = jr;
                             response_body = jr;
                         } else {
                             response_body = "{\"status\":\"received\"}";
@@ -714,11 +703,10 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
 
                     if (msg_text != null and chat_id != null) {
                         // Process the message
-                        if (processIncomingMessage(state.allocator, msg_text.?)) |resp| {
-                            defer state.allocator.free(resp);
+                        if (processIncomingMessage(req_allocator, msg_text.?)) |resp| {
                             // Send reply back to Telegram
                             if (state.telegram_bot_token.len > 0) {
-                                sendTelegramReply(state.allocator, state.telegram_bot_token, chat_id.?, resp) catch {};
+                                sendTelegramReply(req_allocator, state.telegram_bot_token, chat_id.?, resp) catch {};
                             }
                             response_body = "{\"status\":\"ok\"}";
                         } else |_| {
@@ -773,8 +761,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
                     if (body) |b| {
                         const msg_text = jsonStringField(b, "text") orelse jsonStringField(b, "body");
                         if (msg_text) |mt| {
-                            if (processIncomingMessage(state.allocator, mt)) |resp| {
-                                dynamic_body = resp;
+                            if (processIncomingMessage(req_allocator, mt)) |resp| {
                                 response_body = resp;
                             } else |_| {
                                 response_body = "{\"status\":\"received\"}";
@@ -791,8 +778,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
                         // Try to extract message text from WhatsApp payload
                         const msg_text = jsonStringField(b, "text") orelse jsonStringField(b, "body");
                         if (msg_text) |mt| {
-                            if (processIncomingMessage(state.allocator, mt)) |resp| {
-                                dynamic_body = resp;
+                            if (processIncomingMessage(req_allocator, mt)) |resp| {
                                 response_body = resp;
                             } else |_| {
                                 response_body = "{\"status\":\"received\"}";

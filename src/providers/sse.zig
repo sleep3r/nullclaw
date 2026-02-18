@@ -164,7 +164,10 @@ pub fn curlStream(
     }
 
     const term = child.wait() catch return error.CurlWaitError;
-    if (term != .Exited or term.Exited != 0) return error.CurlFailed;
+    switch (term) {
+        .Exited => |code| if (code != 0) return error.CurlFailed,
+        else => return error.CurlFailed,
+    }
 
     const content = if (accumulated.items.len > 0)
         try allocator.dupe(u8, accumulated.items)
@@ -394,7 +397,10 @@ pub fn curlStreamAnthropic(
     }
 
     const term = child.wait() catch return error.CurlWaitError;
-    if (term != .Exited or term.Exited != 0) return error.CurlFailed;
+    switch (term) {
+        .Exited => |code| if (code != 0) return error.CurlFailed,
+        else => return error.CurlFailed,
+    }
 
     const content = if (accumulated.items.len > 0)
         try allocator.dupe(u8, accumulated.items)

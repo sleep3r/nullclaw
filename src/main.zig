@@ -21,7 +21,7 @@ const Command = enum {
 };
 
 fn parseCommand(arg: []const u8) ?Command {
-    const map = .{
+    const command_map = std.StaticStringMap(Command).initComptime(.{
         .{ "agent", .agent },
         .{ "gateway", .gateway },
         .{ "daemon", .daemon },
@@ -38,11 +38,8 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "help", .help },
         .{ "--help", .help },
         .{ "-h", .help },
-    };
-    inline for (map) |entry| {
-        if (std.mem.eql(u8, arg, entry[0])) return entry[1];
-    }
-    return null;
+    });
+    return command_map.get(arg);
 }
 
 pub fn main() !void {

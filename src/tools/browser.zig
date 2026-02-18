@@ -113,9 +113,14 @@ pub const BrowserTool = struct {
             return ToolResult.fail("Failed to wait for browser open command");
         };
 
-        if (term.Exited != 0) {
-            const msg = try std.fmt.allocPrint(allocator, "Browser open command exited with code {d}", .{term.Exited});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        switch (term) {
+            .Exited => |code| if (code != 0) {
+                const msg = try std.fmt.allocPrint(allocator, "Browser open command exited with code {d}", .{code});
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
+            },
+            else => {
+                return ToolResult{ .success = false, .output = "", .error_msg = "Browser open command terminated by signal" };
+            },
         }
 
         const msg = try std.fmt.allocPrint(allocator, "Opened {s} in system browser", .{url});
@@ -157,10 +162,15 @@ pub const BrowserTool = struct {
             return ToolResult.fail("Failed to wait for curl process");
         };
 
-        if (term.Exited != 0) {
-            const detail = if (stderr_out.len > 0) stderr_out else "curl request failed";
-            const msg = try std.fmt.allocPrint(allocator, "curl exited with code {d}: {s}", .{ term.Exited, detail });
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        switch (term) {
+            .Exited => |code| if (code != 0) {
+                const detail = if (stderr_out.len > 0) stderr_out else "curl request failed";
+                const msg = try std.fmt.allocPrint(allocator, "curl exited with code {d}: {s}", .{ code, detail });
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
+            },
+            else => {
+                return ToolResult{ .success = false, .output = "", .error_msg = "curl terminated by signal" };
+            },
         }
 
         if (raw_body.len == 0) {

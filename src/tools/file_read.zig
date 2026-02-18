@@ -2,6 +2,7 @@ const std = @import("std");
 const Tool = @import("root.zig").Tool;
 const ToolResult = @import("root.zig").ToolResult;
 const parseStringField = @import("shell.zig").parseStringField;
+const isPathSafe = @import("file_edit.zig").isPathSafe;
 
 /// Maximum file size to read (10MB).
 const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
@@ -99,22 +100,6 @@ pub const FileReadTool = struct {
         return ToolResult{ .success = true, .output = contents };
     }
 };
-
-/// Check if a relative path is safe (no traversal, no absolute path).
-fn isPathSafe(path: []const u8) bool {
-    // Block absolute paths
-    if (path.len > 0 and path[0] == '/') return false;
-
-    // Block null bytes
-    if (std.mem.indexOfScalar(u8, path, 0) != null) return false;
-
-    // Block ".." components
-    var iter = std.mem.splitScalar(u8, path, '/');
-    while (iter.next()) |component| {
-        if (std.mem.eql(u8, component, "..")) return false;
-    }
-    return true;
-}
 
 // ── Tests ───────────────────────────────────────────────────────────
 

@@ -50,6 +50,12 @@ pub const ScreenshotTool = struct {
         const output_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.workspace_dir, filename });
         defer allocator.free(output_path);
 
+        // In test mode, return a mock result without spawning a real process
+        if (comptime builtin.is_test) {
+            const msg = try std.fmt.allocPrint(allocator, "[IMAGE:{s}]", .{output_path});
+            return ToolResult{ .success = true, .output = msg };
+        }
+
         // Platform-specific screenshot command
         const argv: []const []const u8 = switch (comptime builtin.os.tag) {
             .macos => &.{ "screencapture", "-x", output_path },
@@ -74,15 +80,17 @@ pub const ScreenshotTool = struct {
             return ToolResult.fail("Failed to wait for screenshot command");
         };
 
-        if (term.Exited == 0) {
-            const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.workspace_dir, filename });
-            defer allocator.free(full_path);
-            const msg = try std.fmt.allocPrint(allocator, "[IMAGE:{s}]", .{full_path});
-            return ToolResult{ .success = true, .output = msg };
-        } else {
-            const err_msg = try std.fmt.allocPrint(allocator, "Screenshot command failed: {s}", .{if (stderr.len > 0) stderr else "unknown error"});
-            return ToolResult{ .success = false, .output = "", .error_msg = err_msg };
+        switch (term) {
+            .Exited => |code| if (code == 0) {
+                const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.workspace_dir, filename });
+                defer allocator.free(full_path);
+                const msg = try std.fmt.allocPrint(allocator, "[IMAGE:{s}]", .{full_path});
+                return ToolResult{ .success = true, .output = msg };
+            },
+            else => {},
         }
+        const err_msg = try std.fmt.allocPrint(allocator, "Screenshot command failed: {s}", .{if (stderr.len > 0) stderr else "unknown error"});
+        return ToolResult{ .success = false, .output = "", .error_msg = err_msg };
     }
 };
 
@@ -99,4 +107,23 @@ test "screenshot tool schema has filename" {
     const t = st.tool();
     const schema = t.parametersJson();
     try std.testing.expect(std.mem.indexOf(u8, schema, "filename") != null);
+}
+
+test "screenshot execute returns mock in test mode" {
+    const allocator = std.testing.allocator;
+    var st = ScreenshotTool{ .workspace_dir = "/tmp/workspace" };
+    const result = try st.execute(allocator, "{}");
+    defer allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "[IMAGE:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "screenshot.png") != null);
+}
+
+test "screenshot execute with custom filename" {
+    const allocator = std.testing.allocator;
+    var st = ScreenshotTool{ .workspace_dir = "/tmp" };
+    const result = try st.execute(allocator, "{\"filename\":\"capture.png\"}");
+    defer allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "capture.png") != null);
 }

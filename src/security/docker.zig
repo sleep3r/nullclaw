@@ -8,6 +8,7 @@ const MAX_WORKSPACE_LEN = 2048;
 /// Wraps commands with `docker run` for container isolation.
 /// The workspace directory is bind-mounted into the container at the same path.
 pub const DockerSandbox = struct {
+    allocator: std.mem.Allocator,
     workspace_dir: []const u8,
     image: []const u8,
     /// Pre-built "workspace_dir:workspace_dir" string for the -v flag.
@@ -61,15 +62,19 @@ pub const DockerSandbox = struct {
         return buf[0..total];
     }
 
-    fn isAvailable(_: *anyopaque) bool {
+    fn isAvailable(ptr: *anyopaque) bool {
+        const self = resolve(ptr);
         // Check if docker binary is actually reachable
-        var child = std.process.Child.init(&.{ "docker", "--version" }, std.heap.page_allocator);
+        var child = std.process.Child.init(&.{ "docker", "--version" }, self.allocator);
         child.stderr_behavior = .Ignore;
         child.stdout_behavior = .Ignore;
         child.stdin_behavior = .Ignore;
         child.spawn() catch return false;
         const term = child.wait() catch return false;
-        return term == .Exited and term.Exited == 0;
+        return switch (term) {
+            .Exited => |code| code == 0,
+            else => false,
+        };
     }
 
     fn getName(_: *anyopaque) []const u8 {
@@ -81,8 +86,9 @@ pub const DockerSandbox = struct {
     }
 };
 
-pub fn createDockerSandbox(workspace_dir: []const u8, image: ?[]const u8) DockerSandbox {
+pub fn createDockerSandbox(allocator: std.mem.Allocator, workspace_dir: []const u8, image: ?[]const u8) DockerSandbox {
     var ds = DockerSandbox{
+        .allocator = allocator,
         .workspace_dir = workspace_dir,
         .image = image orelse DockerSandbox.default_image,
     };
@@ -242,20 +248,20 @@ fn isUnderRoot(path: []const u8, root: []const u8) bool {
 // ── Tests ──────────────────────────────────────────────────────────────
 
 test "docker sandbox name" {
-    var dk = createDockerSandbox("/tmp/workspace", null);
+    var dk = createDockerSandbox(std.testing.allocator, "/tmp/workspace", null);
     const sb = dk.sandbox();
     try std.testing.expectEqualStrings("docker", sb.name());
 }
 
 test "docker sandbox isAvailable returns bool" {
-    var dk = createDockerSandbox("/tmp/workspace", null);
+    var dk = createDockerSandbox(std.testing.allocator, "/tmp/workspace", null);
     const sb = dk.sandbox();
     // isAvailable now checks for real docker binary; result depends on environment
     _ = sb.isAvailable();
 }
 
 test "docker sandbox wrap command prepends docker run" {
-    var dk = createDockerSandbox("/tmp/workspace", null);
+    var dk = createDockerSandbox(std.testing.allocator, "/tmp/workspace", null);
     const sb = dk.sandbox();
 
     const argv = [_][]const u8{ "echo", "hello" };
@@ -280,7 +286,7 @@ test "docker sandbox wrap command prepends docker run" {
 }
 
 test "docker sandbox wrap with custom image" {
-    var dk = createDockerSandbox("/tmp/workspace", "ubuntu:22.04");
+    var dk = createDockerSandbox(std.testing.allocator, "/tmp/workspace", "ubuntu:22.04");
     const sb = dk.sandbox();
 
     const argv = [_][]const u8{"ls"};
@@ -294,7 +300,7 @@ test "docker sandbox wrap with custom image" {
 }
 
 test "docker sandbox wrap empty argv" {
-    var dk = createDockerSandbox("/tmp/workspace", null);
+    var dk = createDockerSandbox(std.testing.allocator, "/tmp/workspace", null);
     const sb = dk.sandbox();
 
     const argv = [_][]const u8{};
@@ -306,7 +312,7 @@ test "docker sandbox wrap empty argv" {
 }
 
 test "docker buffer too small returns error" {
-    var dk = createDockerSandbox("/tmp/workspace", null);
+    var dk = createDockerSandbox(std.testing.allocator, "/tmp/workspace", null);
     const sb = dk.sandbox();
 
     const argv = [_][]const u8{ "echo", "test" };
@@ -316,7 +322,7 @@ test "docker buffer too small returns error" {
 }
 
 test "docker sandbox workspace is mounted correctly" {
-    var dk = createDockerSandbox("/home/user/myproject", null);
+    var dk = createDockerSandbox(std.testing.allocator, "/home/user/myproject", null);
     const sb = dk.sandbox();
 
     const argv = [_][]const u8{"bash"};

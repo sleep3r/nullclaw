@@ -292,7 +292,10 @@ fn checkBinaryExists(allocator: std.mem.Allocator, bin_name: []const u8) bool {
 
     child.spawn() catch return false;
     const term = child.wait() catch return false;
-    return term.Exited == 0;
+    return switch (term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
 }
 
 // ── Listing ─────────────────────────────────────────────────────

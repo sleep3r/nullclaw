@@ -4,6 +4,7 @@ const ToolResult = @import("root.zig").ToolResult;
 const parseStringField = @import("shell.zig").parseStringField;
 const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
+const loadScheduler = @import("cron_add.zig").loadScheduler;
 
 /// CronRun tool — force-runs a cron job immediately by its ID, regardless of schedule.
 pub const CronRunTool = struct {
@@ -38,13 +39,6 @@ pub const CronRunTool = struct {
         return 
         \\{"type":"object","properties":{"job_id":{"type":"string","description":"The ID of the cron job to run"}},"required":["job_id"]}
         ;
-    }
-
-    /// Load the CronScheduler from persisted state (~/.nullclaw/cron.json).
-    fn loadScheduler(allocator: std.mem.Allocator) !CronScheduler {
-        var scheduler = CronScheduler.init(allocator, 1024, true);
-        cron.loadJobs(&scheduler) catch {};
-        return scheduler;
     }
 
     fn execute(_: *CronRunTool, allocator: std.mem.Allocator, args_json: []const u8) !ToolResult {
@@ -87,7 +81,10 @@ pub const CronRunTool = struct {
         defer allocator.free(result.stdout);
         defer allocator.free(result.stderr);
 
-        const exit_code: u8 = if (result.term == .Exited) result.term.Exited else 1;
+        const exit_code: u8 = switch (result.term) {
+            .Exited => |code| code,
+            else => 1,
+        };
         const success = exit_code == 0;
         const status_str: []const u8 = if (success) "success" else "error";
 

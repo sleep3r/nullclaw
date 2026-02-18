@@ -415,7 +415,10 @@ pub const TelegramChannel = struct {
 
         _ = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch return error.CurlReadError;
         const term = child.wait() catch return error.CurlWaitError;
-        if (term != .Exited or term.Exited != 0) return error.CurlFailed;
+        switch (term) {
+            .Exited => |code| if (code != 0) return error.CurlFailed,
+            else => return error.CurlFailed,
+        }
     }
 
     // ── Channel vtable ──────────────────────────────────────────────
@@ -588,7 +591,7 @@ pub const TelegramChannel = struct {
 /// Handles: code blocks, inline code, bold, italic, strikethrough,
 /// links, headers, bullet lists. Escapes HTML entities.
 pub fn markdownToTelegramHtml(allocator: std.mem.Allocator, md: []const u8) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
 
     var i: usize = 0;
@@ -755,7 +758,7 @@ fn findTripleBacktick(md: []const u8, from: usize) ?usize {
 }
 
 /// Escape HTML entities for Telegram HTML parse_mode.
-fn appendHtmlEscaped(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) !void {
+fn appendHtmlEscaped(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, text: []const u8) !void {
     for (text) |c| {
         switch (c) {
             '&' => try buf.appendSlice(allocator, "&amp;"),

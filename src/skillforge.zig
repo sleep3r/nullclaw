@@ -459,13 +459,21 @@ pub fn integrate(allocator: std.mem.Allocator, candidate: SkillCandidate, skills
         };
     };
 
-    if (term.Exited != 0) {
-        return IntegrationResult{
+    switch (term) {
+        .Exited => |code| if (code != 0) {
+            return IntegrationResult{
+                .skill_name = safe_name,
+                .install_path = skills_dir,
+                .success = false,
+                .error_message = "git clone exited with non-zero status",
+            };
+        },
+        else => return IntegrationResult{
             .skill_name = safe_name,
             .install_path = skills_dir,
             .success = false,
-            .error_message = "git clone exited with non-zero status",
-        };
+            .error_message = "git clone terminated by signal",
+        },
     }
 
     // Verify the cloned repo has expected structure

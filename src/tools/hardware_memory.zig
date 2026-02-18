@@ -100,7 +100,10 @@ fn probeRsAvailable(allocator: std.mem.Allocator) bool {
     _ = child.stdout.?.readToEndAlloc(allocator, 4096) catch "";
     _ = child.stderr.?.readToEndAlloc(allocator, 4096) catch "";
     const term = child.wait() catch return false;
-    return term.Exited == 0;
+    return switch (term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
 }
 
 /// Execute a probe-rs read command: `probe-rs read --chip CHIP ADDRESS LENGTH`
@@ -131,18 +134,23 @@ fn probeRead(allocator: std.mem.Allocator, chip: []const u8, address: u64, lengt
     defer allocator.free(stderr);
 
     const term = try child.wait();
-    const success = term.Exited == 0;
-
-    if (success) {
-        const out = try allocator.dupe(u8, if (stdout.len > 0) stdout else "(no output from probe-rs)");
-        return ToolResult{ .success = true, .output = out };
-    } else {
-        const err_msg = try std.fmt.allocPrint(
-            allocator,
-            "probe-rs read failed (exit {d}): {s}",
-            .{ term.Exited, if (stderr.len > 0) stderr else "unknown error" },
-        );
-        return ToolResult{ .success = false, .output = "", .error_msg = err_msg };
+    switch (term) {
+        .Exited => |code| {
+            if (code == 0) {
+                const out = try allocator.dupe(u8, if (stdout.len > 0) stdout else "(no output from probe-rs)");
+                return ToolResult{ .success = true, .output = out };
+            } else {
+                const err_msg = try std.fmt.allocPrint(
+                    allocator,
+                    "probe-rs read failed (exit {d}): {s}",
+                    .{ code, if (stderr.len > 0) stderr else "unknown error" },
+                );
+                return ToolResult{ .success = false, .output = "", .error_msg = err_msg };
+            }
+        },
+        else => {
+            return ToolResult{ .success = false, .output = "", .error_msg = "probe-rs read terminated by signal" };
+        },
     }
 }
 
@@ -172,22 +180,27 @@ fn probeWrite(allocator: std.mem.Allocator, chip: []const u8, address: u64, valu
     defer allocator.free(stderr);
 
     const term = try child.wait();
-    const success = term.Exited == 0;
-
-    if (success) {
-        const out = try std.fmt.allocPrint(
-            allocator,
-            "Write OK: 0x{X:0>8} <- {s} ({s}){s}",
-            .{ address, value, chip, if (stdout.len > 0) stdout else "" },
-        );
-        return ToolResult{ .success = true, .output = out };
-    } else {
-        const err_msg = try std.fmt.allocPrint(
-            allocator,
-            "probe-rs write failed (exit {d}): {s}",
-            .{ term.Exited, if (stderr.len > 0) stderr else "unknown error" },
-        );
-        return ToolResult{ .success = false, .output = "", .error_msg = err_msg };
+    switch (term) {
+        .Exited => |code| {
+            if (code == 0) {
+                const out = try std.fmt.allocPrint(
+                    allocator,
+                    "Write OK: 0x{X:0>8} <- {s} ({s}){s}",
+                    .{ address, value, chip, if (stdout.len > 0) stdout else "" },
+                );
+                return ToolResult{ .success = true, .output = out };
+            } else {
+                const err_msg = try std.fmt.allocPrint(
+                    allocator,
+                    "probe-rs write failed (exit {d}): {s}",
+                    .{ code, if (stderr.len > 0) stderr else "unknown error" },
+                );
+                return ToolResult{ .success = false, .output = "", .error_msg = err_msg };
+            }
+        },
+        else => {
+            return ToolResult{ .success = false, .output = "", .error_msg = "probe-rs write terminated by signal" };
+        },
     }
 }
 

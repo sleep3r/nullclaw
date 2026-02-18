@@ -79,6 +79,18 @@ pub const Channel = struct {
     }
 };
 
+/// Comptime check that a type correctly implements the Channel interface.
+pub fn assertChannelInterface(comptime T: type) void {
+    if (!@hasDecl(T, "channel")) @compileError(@typeName(T) ++ " missing channel() method");
+    if (!@hasDecl(T, "vtable")) @compileError(@typeName(T) ++ " missing vtable constant");
+    const vt = T.vtable;
+    _ = vt.start;
+    _ = vt.stop;
+    _ = vt.send;
+    _ = vt.name;
+    _ = vt.healthCheck;
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Channel Sub-modules
 // ════════════════════════════════════════════════════════════════════════════
@@ -121,8 +133,8 @@ pub const SplitIterator = struct {
         }
         var split_at = self.max;
         // Walk backwards to find a valid UTF-8 char boundary
-        while (split_at > 0 and (self.remaining[split_at] & 0xC0) == 0x80) {
-            split_at -= 1;
+        while ((self.remaining[split_at] & 0xC0) == 0x80) {
+            if (split_at > 0) split_at -= 1 else break;
         }
         if (split_at == 0) {
             // No valid boundary found going backward; advance forward

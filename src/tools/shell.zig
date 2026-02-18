@@ -85,15 +85,19 @@ pub const ShellTool = struct {
         defer allocator.free(stderr);
 
         const term = try child.wait();
-        const success = term.Exited == 0;
-
-        // Build output — allocator-owned copy for the caller
-        if (success) {
-            const out = try allocator.dupe(u8, if (stdout.len > 0) stdout else "(no output)");
-            return ToolResult{ .success = true, .output = out };
-        } else {
-            const err_out = try allocator.dupe(u8, if (stderr.len > 0) stderr else "Command failed with non-zero exit code");
-            return ToolResult{ .success = false, .output = "", .error_msg = err_out };
+        switch (term) {
+            .Exited => |code| {
+                if (code == 0) {
+                    const out = try allocator.dupe(u8, if (stdout.len > 0) stdout else "(no output)");
+                    return ToolResult{ .success = true, .output = out };
+                } else {
+                    const err_out = try allocator.dupe(u8, if (stderr.len > 0) stderr else "Command failed with non-zero exit code");
+                    return ToolResult{ .success = false, .output = "", .error_msg = err_out };
+                }
+            },
+            else => {
+                return ToolResult{ .success = false, .output = "", .error_msg = "Command terminated by signal" };
+            },
         }
     }
 };

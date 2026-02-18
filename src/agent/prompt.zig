@@ -370,7 +370,7 @@ test "buildSystemPrompt datetime appears before runtime" {
     });
     defer allocator.free(prompt);
 
-    const dt_pos = std.mem.indexOf(u8, prompt, "## Current Date & Time") orelse unreachable;
-    const rt_pos = std.mem.indexOf(u8, prompt, "## Runtime") orelse unreachable;
+    const dt_pos = std.mem.indexOf(u8, prompt, "## Current Date & Time") orelse return error.SectionNotFound;
+    const rt_pos = std.mem.indexOf(u8, prompt, "## Runtime") orelse return error.SectionNotFound;
     try std.testing.expect(dt_pos < rt_pos);
 }

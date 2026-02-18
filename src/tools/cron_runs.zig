@@ -5,6 +5,7 @@ const parseStringField = @import("shell.zig").parseStringField;
 const parseIntField = @import("shell.zig").parseIntField;
 const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
+const loadScheduler = @import("cron_add.zig").loadScheduler;
 
 /// Cron runs tool — shows execution history for a cron job.
 pub const CronRunsTool = struct {
@@ -39,13 +40,6 @@ pub const CronRunsTool = struct {
         return 
         \\{"type":"object","properties":{"job_id":{"type":"string","description":"ID of the cron job"},"limit":{"type":"integer","description":"Max runs to show (default 10)"}},"required":["job_id"]}
         ;
-    }
-
-    /// Load the CronScheduler from persisted state (~/.nullclaw/cron.json).
-    fn loadScheduler(allocator: std.mem.Allocator) !CronScheduler {
-        var scheduler = CronScheduler.init(allocator, 1024, true);
-        cron.loadJobs(&scheduler) catch {};
-        return scheduler;
     }
 
     fn execute(_: *CronRunsTool, allocator: std.mem.Allocator, args_json: []const u8) !ToolResult {

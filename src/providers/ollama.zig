@@ -37,6 +37,7 @@ const OllamaChatResponse = struct {
 /// 2. Prefixed names: "tool.shell" -> "shell"
 /// 3. Normal: return as-is
 fn extractToolNameAndArgs(
+    allocator: std.mem.Allocator,
     name: []const u8,
     arguments: std.json.Value,
 ) struct { name: []const u8, args: std.json.Value } {
@@ -49,7 +50,7 @@ fn extractToolNameAndArgs(
         if (arguments == .object) {
             if (arguments.object.get("name")) |nested_name_val| {
                 if (nested_name_val == .string) {
-                    const nested_args = if (arguments.object.get("arguments")) |a| a else std.json.Value{ .object = std.json.ObjectMap.init(std.heap.page_allocator) };
+                    const nested_args = if (arguments.object.get("arguments")) |a| a else std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
                     return .{ .name = nested_name_val.string, .args = nested_args };
                 }
             }
@@ -87,7 +88,7 @@ fn formatToolCallsForLoop(
     for (tool_calls, 0..) |tc, i| {
         if (i > 0) try result.append(allocator, ',');
 
-        const extracted = extractToolNameAndArgs(tc.function.name, tc.function.arguments);
+        const extracted = extractToolNameAndArgs(allocator, tc.function.name, tc.function.arguments);
 
         // Serialize arguments to string
         const args_str = if (extracted.args == .null)
@@ -395,17 +396,17 @@ test "supportsNativeTools returns false" {
 // ─── Tool Call Tests ─────────────────────────────────────────────────────────
 
 test "extractToolNameAndArgs with normal name" {
-    const result = extractToolNameAndArgs("shell", .null);
+    const result = extractToolNameAndArgs(std.testing.allocator, "shell", .null);
     try std.testing.expectEqualStrings("shell", result.name);
 }
 
 test "extractToolNameAndArgs with tool. prefix" {
-    const result = extractToolNameAndArgs("tool.shell", .null);
+    const result = extractToolNameAndArgs(std.testing.allocator, "tool.shell", .null);
     try std.testing.expectEqualStrings("shell", result.name);
 }
 
 test "extractToolNameAndArgs with tools. prefix" {
-    const result = extractToolNameAndArgs("tools.file_read", .null);
+    const result = extractToolNameAndArgs(std.testing.allocator, "tools.file_read", .null);
     try std.testing.expectEqualStrings("file_read", result.name);
 }
 
@@ -417,11 +418,11 @@ test "extractToolNameAndArgs with nested tool_call wrapper" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
     defer parsed.deinit();
 
-    const result = extractToolNameAndArgs("tool_call", parsed.value);
+    const result = extractToolNameAndArgs(std.testing.allocator, "tool_call", parsed.value);
     try std.testing.expectEqualStrings("shell", result.name);
     // The inner arguments should contain "command"
     try std.testing.expect(result.args == .object);
-    const cmd = result.args.object.get("command") orelse unreachable;
+    const cmd = result.args.object.get("command") orelse return error.MissingField;
     try std.testing.expect(cmd == .string);
     try std.testing.expectEqualStrings("date", cmd.string);
 }
@@ -433,7 +434,7 @@ test "extractToolNameAndArgs with tool.call wrapper" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
     defer parsed.deinit();
 
-    const result = extractToolNameAndArgs("tool.call", parsed.value);
+    const result = extractToolNameAndArgs(std.testing.allocator, "tool.call", parsed.value);
     try std.testing.expectEqualStrings("file_read", result.name);
 }
 

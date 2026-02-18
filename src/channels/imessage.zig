@@ -65,8 +65,11 @@ pub const IMessageChannel = struct {
         defer self.allocator.free(result.stdout);
         defer self.allocator.free(result.stderr);
 
-        if (result.term.Exited != 0) {
-            return error.IMessageSendFailed;
+        switch (result.term) {
+            .Exited => |code| if (code != 0) {
+                return error.IMessageSendFailed;
+            },
+            else => return error.IMessageSendFailed,
         }
     }
 

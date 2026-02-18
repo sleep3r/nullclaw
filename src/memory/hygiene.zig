@@ -38,7 +38,7 @@ pub const HygieneConfig = struct {
 
 /// Run memory hygiene if the cadence window has elapsed.
 /// This is intentionally best-effort: failures are returned but non-fatal.
-pub fn runIfDue(config: HygieneConfig, mem: ?Memory) HygieneReport {
+pub fn runIfDue(allocator: std.mem.Allocator, config: HygieneConfig, mem: ?Memory) HygieneReport {
     if (!config.hygiene_enabled) return .{};
 
     if (!shouldRunNow(config, mem)) return .{};
@@ -47,18 +47,18 @@ pub fn runIfDue(config: HygieneConfig, mem: ?Memory) HygieneReport {
 
     // Archive old daily memory files
     if (config.archive_after_days > 0) {
-        report.archived_memory_files = archiveOldFiles(config) catch 0;
+        report.archived_memory_files = archiveOldFiles(allocator, config) catch 0;
     }
 
     // Purge expired archives
     if (config.purge_after_days > 0) {
-        report.purged_memory_archives = purgeOldArchives(config) catch 0;
+        report.purged_memory_archives = purgeOldArchives(allocator, config) catch 0;
     }
 
     // Prune old conversation rows
     if (config.conversation_retention_days > 0) {
         if (mem) |m| {
-            report.pruned_conversation_rows = pruneConversationRows(std.heap.page_allocator, m, config.conversation_retention_days) catch 0;
+            report.pruned_conversation_rows = pruneConversationRows(allocator, m, config.conversation_retention_days) catch 0;
         }
     }
 
@@ -98,15 +98,15 @@ fn shouldRunNow(config: HygieneConfig, mem: ?Memory) bool {
 }
 
 /// Archive old daily memory .md files from memory/ to memory/archive/.
-fn archiveOldFiles(config: HygieneConfig) !u64 {
-    const memory_dir_path = try std.fs.path.join(std.heap.page_allocator, &.{ config.workspace_dir, "memory" });
-    defer std.heap.page_allocator.free(memory_dir_path);
+fn archiveOldFiles(allocator: std.mem.Allocator, config: HygieneConfig) !u64 {
+    const memory_dir_path = try std.fs.path.join(allocator, &.{ config.workspace_dir, "memory" });
+    defer allocator.free(memory_dir_path);
 
     var memory_dir = std.fs.cwd().openDir(memory_dir_path, .{ .iterate = true }) catch return 0;
     defer memory_dir.close();
 
-    const archive_path = try std.fs.path.join(std.heap.page_allocator, &.{ config.workspace_dir, "memory", "archive" });
-    defer std.heap.page_allocator.free(archive_path);
+    const archive_path = try std.fs.path.join(allocator, &.{ config.workspace_dir, "memory", "archive" });
+    defer allocator.free(archive_path);
 
     std.fs.cwd().makePath(archive_path) catch {};
 
@@ -127,10 +127,10 @@ fn archiveOldFiles(config: HygieneConfig) !u64 {
         if (mtime_secs >= cutoff_secs) continue;
 
         // Build full source and destination paths, then rename
-        const src_path = std.fs.path.join(std.heap.page_allocator, &.{ memory_dir_path, name }) catch continue;
-        defer std.heap.page_allocator.free(src_path);
-        const dst_path = std.fs.path.join(std.heap.page_allocator, &.{ archive_path, name }) catch continue;
-        defer std.heap.page_allocator.free(dst_path);
+        const src_path = std.fs.path.join(allocator, &.{ memory_dir_path, name }) catch continue;
+        defer allocator.free(src_path);
+        const dst_path = std.fs.path.join(allocator, &.{ archive_path, name }) catch continue;
+        defer allocator.free(dst_path);
 
         std.fs.cwd().rename(src_path, dst_path) catch {
             // Fallback: try copy + delete
@@ -144,9 +144,9 @@ fn archiveOldFiles(config: HygieneConfig) !u64 {
 }
 
 /// Purge archived files older than the retention period.
-fn purgeOldArchives(config: HygieneConfig) !u64 {
-    const archive_path = try std.fs.path.join(std.heap.page_allocator, &.{ config.workspace_dir, "memory", "archive" });
-    defer std.heap.page_allocator.free(archive_path);
+fn purgeOldArchives(allocator: std.mem.Allocator, config: HygieneConfig) !u64 {
+    const archive_path = try std.fs.path.join(allocator, &.{ config.workspace_dir, "memory", "archive" });
+    defer allocator.free(archive_path);
 
     var archive_dir = std.fs.cwd().openDir(archive_path, .{ .iterate = true }) catch return 0;
     defer archive_dir.close();
@@ -220,22 +220,22 @@ test "HygieneReport zero actions" {
 }
 
 test "runIfDue disabled returns empty" {
-    const config = HygieneConfig{
+    const cfg = HygieneConfig{
         .hygiene_enabled = false,
     };
-    const report = runIfDue(config, null);
+    const report = runIfDue(std.testing.allocator, cfg, null);
     try std.testing.expectEqual(@as(u64, 0), report.totalActions());
 }
 
 test "runIfDue no memory first run" {
-    const config = HygieneConfig{
+    const cfg = HygieneConfig{
         .hygiene_enabled = true,
         .archive_after_days = 0,
         .purge_after_days = 0,
         .conversation_retention_days = 0,
         .workspace_dir = "/nonexistent",
     };
-    const report = runIfDue(config, null);
+    const report = runIfDue(std.testing.allocator, cfg, null);
     // Should run but all operations disabled or paths don't exist
     try std.testing.expectEqual(@as(u64, 0), report.totalActions());
 }

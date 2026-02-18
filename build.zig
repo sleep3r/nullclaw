@@ -1,11 +1,19 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const sqlite_include: std.Build.LazyPath = .{ .cwd_relative = "/opt/homebrew/opt/sqlite/include" };
-    const sqlite_lib: std.Build.LazyPath = .{ .cwd_relative = "/opt/homebrew/opt/sqlite/lib" };
+    const default_include = if (builtin.os.tag == .macos) "/opt/homebrew/opt/sqlite/include" else "/usr/include";
+    const default_lib = if (builtin.os.tag == .macos) "/opt/homebrew/opt/sqlite/lib" else "/usr/lib";
+
+    const sqlite_include: std.Build.LazyPath = .{
+        .cwd_relative = b.option([]const u8, "sqlite-include", "Path to SQLite include directory") orelse default_include,
+    };
+    const sqlite_lib: std.Build.LazyPath = .{
+        .cwd_relative = b.option([]const u8, "sqlite-lib", "Path to SQLite lib directory") orelse default_lib,
+    };
 
     // ---------- library module (importable by consumers) ----------
     const lib_mod = b.addModule("nullclaw", .{

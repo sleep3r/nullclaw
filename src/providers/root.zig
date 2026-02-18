@@ -364,6 +364,18 @@ pub const Provider = struct {
     }
 };
 
+/// Comptime check that a type correctly implements the Provider interface.
+pub fn assertProviderInterface(comptime T: type) void {
+    if (!@hasDecl(T, "provider")) @compileError(@typeName(T) ++ " missing provider() method");
+    if (!@hasDecl(T, "vtable")) @compileError(@typeName(T) ++ " missing vtable constant");
+    const vt = T.vtable;
+    _ = vt.chatWithSystem;
+    _ = vt.chat;
+    _ = vt.supportsNativeTools;
+    _ = vt.getName;
+    _ = vt.deinit;
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Secret Scrubbing
 // ════════════════════════════════════════════════════════════════════════════
@@ -652,32 +664,64 @@ pub const ProviderKind = enum {
 
 /// Determine which provider to create from a name string.
 pub fn classifyProvider(name: []const u8) ProviderKind {
-    if (std.mem.eql(u8, name, "anthropic")) return .anthropic_provider;
-    if (std.mem.eql(u8, name, "openai")) return .openai_provider;
-    if (std.mem.eql(u8, name, "openrouter")) return .openrouter_provider;
-    if (std.mem.eql(u8, name, "ollama")) return .ollama_provider;
-    if (std.mem.eql(u8, name, "gemini") or std.mem.eql(u8, name, "google") or std.mem.eql(u8, name, "google-gemini")) return .gemini_provider;
-    if (std.mem.eql(u8, name, "claude-cli")) return .claude_cli_provider;
-    if (std.mem.eql(u8, name, "codex-cli")) return .codex_cli_provider;
+    const provider_map = std.StaticStringMap(ProviderKind).initComptime(.{
+        .{ "anthropic", .anthropic_provider },
+        .{ "openai", .openai_provider },
+        .{ "openrouter", .openrouter_provider },
+        .{ "ollama", .ollama_provider },
+        .{ "gemini", .gemini_provider },
+        .{ "google", .gemini_provider },
+        .{ "google-gemini", .gemini_provider },
+        .{ "claude-cli", .claude_cli_provider },
+        .{ "codex-cli", .codex_cli_provider },
+        // OpenAI-compatible providers
+        .{ "venice", .compatible_provider },
+        .{ "vercel", .compatible_provider },
+        .{ "vercel-ai", .compatible_provider },
+        .{ "cloudflare", .compatible_provider },
+        .{ "cloudflare-ai", .compatible_provider },
+        .{ "moonshot", .compatible_provider },
+        .{ "kimi", .compatible_provider },
+        .{ "synthetic", .compatible_provider },
+        .{ "opencode", .compatible_provider },
+        .{ "opencode-zen", .compatible_provider },
+        .{ "zai", .compatible_provider },
+        .{ "z.ai", .compatible_provider },
+        .{ "glm", .compatible_provider },
+        .{ "zhipu", .compatible_provider },
+        .{ "minimax", .compatible_provider },
+        .{ "bedrock", .compatible_provider },
+        .{ "aws-bedrock", .compatible_provider },
+        .{ "qianfan", .compatible_provider },
+        .{ "baidu", .compatible_provider },
+        .{ "qwen", .compatible_provider },
+        .{ "dashscope", .compatible_provider },
+        .{ "qwen-intl", .compatible_provider },
+        .{ "dashscope-intl", .compatible_provider },
+        .{ "qwen-us", .compatible_provider },
+        .{ "dashscope-us", .compatible_provider },
+        .{ "groq", .compatible_provider },
+        .{ "mistral", .compatible_provider },
+        .{ "xai", .compatible_provider },
+        .{ "grok", .compatible_provider },
+        .{ "deepseek", .compatible_provider },
+        .{ "together", .compatible_provider },
+        .{ "together-ai", .compatible_provider },
+        .{ "fireworks", .compatible_provider },
+        .{ "fireworks-ai", .compatible_provider },
+        .{ "perplexity", .compatible_provider },
+        .{ "cohere", .compatible_provider },
+        .{ "copilot", .compatible_provider },
+        .{ "github-copilot", .compatible_provider },
+        .{ "lmstudio", .compatible_provider },
+        .{ "lm-studio", .compatible_provider },
+        .{ "nvidia", .compatible_provider },
+        .{ "nvidia-nim", .compatible_provider },
+        .{ "build.nvidia.com", .compatible_provider },
+        .{ "astrai", .compatible_provider },
+    });
 
-    // OpenAI-compatible providers
-    const compat_names = [_][]const u8{
-        "venice",        "vercel",         "vercel-ai",        "cloudflare",
-        "cloudflare-ai", "moonshot",       "kimi",             "synthetic",
-        "opencode",      "opencode-zen",   "zai",              "z.ai",
-        "glm",           "zhipu",          "minimax",          "bedrock",
-        "aws-bedrock",   "qianfan",        "baidu",            "qwen",
-        "dashscope",     "qwen-intl",      "dashscope-intl",   "qwen-us",
-        "dashscope-us",  "groq",           "mistral",          "xai",
-        "grok",          "deepseek",       "together",         "together-ai",
-        "fireworks",     "fireworks-ai",   "perplexity",       "cohere",
-        "copilot",       "github-copilot", "lmstudio",         "lm-studio",
-        "nvidia",        "nvidia-nim",     "build.nvidia.com", "astrai",
-    };
-
-    for (compat_names) |cn| {
-        if (std.mem.eql(u8, name, cn)) return .compatible_provider;
-    }
+    if (provider_map.get(name)) |kind| return kind;
 
     // custom: prefix
     if (std.mem.startsWith(u8, name, "custom:")) return .compatible_provider;

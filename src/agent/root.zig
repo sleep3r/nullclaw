@@ -4,6 +4,7 @@
 //! system prompt construction, history management, single and interactive modes.
 
 const std = @import("std");
+const log = std.log.scoped(.agent);
 const Config = @import("../config.zig").Config;
 const providers = @import("../providers/root.zig");
 const Provider = providers.Provider;
@@ -858,7 +859,7 @@ fn cliStreamCallback(_: *anyopaque, chunk: providers.StreamChunk) void {
 /// This is the main entry point called by `nullclaw agent`.
 pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const cfg = Config.load(allocator) catch {
-        std.debug.print("No config found. Run `nullclaw onboard` first.\n", .{});
+        log.err("No config found. Run `nullclaw onboard` first.", .{});
         return;
     };
 
@@ -898,7 +899,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const mcp_mod = @import("../mcp.zig");
     const mcp_tools: ?[]const tools_mod.Tool = if (cfg.mcp_servers.len > 0)
         mcp_mod.initMcpTools(allocator, cfg.mcp_servers) catch |err| blk: {
-            std.debug.print("MCP: init failed: {}\n", .{err});
+            log.warn("MCP: init failed: {}", .{err});
             break :blk null;
         }
     else

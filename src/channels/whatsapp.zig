@@ -134,16 +134,16 @@ pub const WhatsAppChannel = struct {
         // Strip leading '+' from recipient for the API
         const to = if (recipient.len > 0 and recipient[0] == '+') recipient[1..] else recipient;
 
-        // Build JSON body
-        var body_buf: [8192]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&body_buf);
-        const w = fbs.writer();
+        // Build JSON body dynamically
+        var body_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_list.deinit(self.allocator);
+        const w = body_list.writer(self.allocator);
         try w.writeAll("{\"messaging_product\":\"whatsapp\",\"recipient_type\":\"individual\",\"to\":\"");
         try w.writeAll(to);
         try w.writeAll("\",\"type\":\"text\",\"text\":{\"preview_url\":false,\"body\":");
         try root.appendJsonStringW(w, text);
         try w.writeAll("}}");
-        const body = fbs.getWritten();
+        const body = body_list.items;
 
         // Build auth header
         var auth_buf: [512]u8 = undefined;

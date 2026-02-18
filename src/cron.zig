@@ -451,7 +451,10 @@ pub const CronScheduler = struct {
                     };
                     defer self.allocator.free(result.stderr);
 
-                    const success = (result.term == .Exited and result.term.Exited == 0);
+                    const success = switch (result.term) {
+                        .Exited => |code| code == 0,
+                        else => false,
+                    };
                     job.last_run_secs = now;
                     job.last_status = if (success) "ok" else "error";
 
@@ -710,14 +713,14 @@ pub fn cliListJobs(allocator: std.mem.Allocator) !void {
 
     const jobs = scheduler.listJobs();
     if (jobs.len == 0) {
-        std.debug.print("No scheduled tasks yet.\n\n", .{});
-        std.debug.print("Usage:\n", .{});
-        std.debug.print("  nullclaw cron add '*/10 * * * *' 'echo hello'\n", .{});
-        std.debug.print("  nullclaw cron once 30m 'echo reminder'\n", .{});
+        log.info("No scheduled tasks yet.", .{});
+        log.info("Usage:", .{});
+        log.info("  nullclaw cron add '*/10 * * * *' 'echo hello'", .{});
+        log.info("  nullclaw cron once 30m 'echo reminder'", .{});
         return;
     }
 
-    std.debug.print("Scheduled jobs ({d}):\n", .{jobs.len});
+    log.info("Scheduled jobs ({d}):", .{jobs.len});
     for (jobs) |job| {
         const flags: []const u8 = blk: {
             if (job.paused and job.one_shot) break :blk " [paused, one-shot]";
@@ -726,7 +729,7 @@ pub fn cliListJobs(allocator: std.mem.Allocator) !void {
             break :blk "";
         };
         const status = job.last_status orelse "n/a";
-        std.debug.print("- {s} | {s} | next={d} | status={s}{s}\n    cmd: {s}\n", .{
+        log.info("- {s} | {s} | next={d} | status={s}{s} cmd: {s}", .{
             job.id,
             job.expression,
             job.next_run_secs,
@@ -746,10 +749,10 @@ pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: 
     const job = try scheduler.addJob(expression, command);
     try saveJobs(&scheduler);
 
-    std.debug.print("Added cron job {s}\n", .{job.id});
-    std.debug.print("  Expr: {s}\n", .{job.expression});
-    std.debug.print("  Next: {d}\n", .{job.next_run_secs});
-    std.debug.print("  Cmd : {s}\n", .{job.command});
+    log.info("Added cron job {s}", .{job.id});
+    log.info("  Expr: {s}", .{job.expression});
+    log.info("  Next: {d}", .{job.next_run_secs});
+    log.info("  Cmd : {s}", .{job.command});
 }
 
 /// CLI: add a one-shot delayed task.
@@ -761,9 +764,9 @@ pub fn cliAddOnce(allocator: std.mem.Allocator, delay: []const u8, command: []co
     const job = try scheduler.addOnce(delay, command);
     try saveJobs(&scheduler);
 
-    std.debug.print("Added one-shot task {s}\n", .{job.id});
-    std.debug.print("  Runs at: {d}\n", .{job.next_run_secs});
-    std.debug.print("  Cmd    : {s}\n", .{job.command});
+    log.info("Added one-shot task {s}", .{job.id});
+    log.info("  Runs at: {d}", .{job.next_run_secs});
+    log.info("  Cmd    : {s}", .{job.command});
 }
 
 /// CLI: remove a cron job by ID.
@@ -774,9 +777,9 @@ pub fn cliRemoveJob(allocator: std.mem.Allocator, id: []const u8) !void {
 
     if (scheduler.removeJob(id)) {
         try saveJobs(&scheduler);
-        std.debug.print("Removed cron job {s}\n", .{id});
+        log.info("Removed cron job {s}", .{id});
     } else {
-        std.debug.print("Cron job '{s}' not found\n", .{id});
+        log.warn("Cron job '{s}' not found", .{id});
     }
 }
 
@@ -788,9 +791,9 @@ pub fn cliPauseJob(allocator: std.mem.Allocator, id: []const u8) !void {
 
     if (scheduler.pauseJob(id)) {
         try saveJobs(&scheduler);
-        std.debug.print("Paused job {s}\n", .{id});
+        log.info("Paused job {s}", .{id});
     } else {
-        std.debug.print("Cron job '{s}' not found\n", .{id});
+        log.warn("Cron job '{s}' not found", .{id});
     }
 }
 
@@ -802,9 +805,9 @@ pub fn cliResumeJob(allocator: std.mem.Allocator, id: []const u8) !void {
 
     if (scheduler.resumeJob(id)) {
         try saveJobs(&scheduler);
-        std.debug.print("Resumed job {s}\n", .{id});
+        log.info("Resumed job {s}", .{id});
     } else {
-        std.debug.print("Cron job '{s}' not found\n", .{id});
+        log.warn("Cron job '{s}' not found", .{id});
     }
 }
 
@@ -814,21 +817,24 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
     try loadJobs(&scheduler);
 
     if (scheduler.getJob(id)) |job| {
-        std.debug.print("Running job '{s}': {s}\n", .{ id, job.command });
+        log.info("Running job '{s}': {s}", .{ id, job.command });
         const result = std.process.Child.run(.{
             .allocator = allocator,
             .argv = &.{ "sh", "-c", job.command },
         }) catch |err| {
-            std.debug.print("Job '{s}' failed: {s}\n", .{ id, @errorName(err) });
+            log.err("Job '{s}' failed: {s}", .{ id, @errorName(err) });
             return;
         };
         defer allocator.free(result.stdout);
         defer allocator.free(result.stderr);
-        if (result.stdout.len > 0) std.debug.print("{s}", .{result.stdout});
-        const exit_code: u8 = if (result.term == .Exited) result.term.Exited else 1;
-        std.debug.print("Job '{s}' completed (exit {d}).\n", .{ id, exit_code });
+        if (result.stdout.len > 0) log.info("{s}", .{result.stdout});
+        const exit_code: u8 = switch (result.term) {
+            .Exited => |code| code,
+            else => 1,
+        };
+        log.info("Job '{s}' completed (exit {d}).", .{ id, exit_code });
     } else {
-        std.debug.print("Cron job '{s}' not found\n", .{id});
+        log.warn("Cron job '{s}' not found", .{id});
     }
 }
 
@@ -851,9 +857,9 @@ pub fn cliUpdateJob(
     };
     if (scheduler.updateJob(allocator, id, patch)) {
         try saveJobs(&scheduler);
-        std.debug.print("Updated job {s}\n", .{id});
+        log.info("Updated job {s}", .{id});
     } else {
-        std.debug.print("Cron job '{s}' not found\n", .{id});
+        log.warn("Cron job '{s}' not found", .{id});
     }
 }
 
@@ -864,12 +870,12 @@ pub fn cliListRuns(allocator: std.mem.Allocator, id: []const u8) !void {
     try loadJobs(&scheduler);
 
     if (scheduler.getJob(id)) |job| {
-        std.debug.print("Run history for job {s} ({s}):\n", .{ id, job.command });
+        log.info("Run history for job {s} ({s}):", .{ id, job.command });
         const status = job.last_status orelse "never run";
-        std.debug.print("  Last status: {s}\n", .{status});
-        std.debug.print("  Next run:    {d}\n", .{job.next_run_secs});
+        log.info("  Last status: {s}", .{status});
+        log.info("  Next run:    {d}", .{job.next_run_secs});
     } else {
-        std.debug.print("Cron job '{s}' not found\n", .{id});
+        log.warn("Cron job '{s}' not found", .{id});
     }
 }
 

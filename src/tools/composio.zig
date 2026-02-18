@@ -125,10 +125,20 @@ pub const ComposioTool = struct {
 
         // Build JSON body with arguments, user_id, and optional connected_account_id
         const params_str = parseStringField(args_json, "params") orelse "{}";
-        const body = if (connected_account_id) |caid|
-            try std.fmt.allocPrint(allocator, "{{\"arguments\":{s},\"user_id\":\"{s}\",\"connected_account_id\":\"{s}\"}}", .{ params_str, eid, caid })
-        else
-            try std.fmt.allocPrint(allocator, "{{\"arguments\":{s},\"user_id\":\"{s}\"}}", .{ params_str, eid });
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(allocator);
+        try out.appendSlice(allocator, "{\"arguments\":");
+        try out.appendSlice(allocator, params_str);
+        try out.appendSlice(allocator, ",\"user_id\":\"");
+        try appendJsonEscaped(&out, allocator, eid);
+        try out.appendSlice(allocator, "\"");
+        if (connected_account_id) |caid| {
+            try out.appendSlice(allocator, ",\"connected_account_id\":\"");
+            try appendJsonEscaped(&out, allocator, caid);
+            try out.appendSlice(allocator, "\"");
+        }
+        try out.appendSlice(allocator, "}");
+        const body = try out.toOwnedSlice(allocator);
         defer allocator.free(body);
 
         return self.httpPost(allocator, url, body);
@@ -173,7 +183,12 @@ pub const ComposioTool = struct {
         const url = std.fmt.bufPrint(&url_buf, COMPOSIO_API_BASE_V3 ++ "/connected_accounts/link", .{}) catch
             return ToolResult.fail("URL too long");
 
-        const body = try std.fmt.allocPrint(allocator, "{{\"user_id\":\"{s}\"}}", .{entity});
+        var body_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_buf.deinit(allocator);
+        try body_buf.appendSlice(allocator, "{\"user_id\":\"");
+        try appendJsonEscaped(&body_buf, allocator, entity);
+        try body_buf.appendSlice(allocator, "\"}");
+        const body = try body_buf.toOwnedSlice(allocator);
         defer allocator.free(body);
 
         return self.httpPost(allocator, url, body);
@@ -202,7 +217,14 @@ pub const ComposioTool = struct {
         const auth_header = try std.fmt.allocPrint(allocator, "X-API-Key: {s}", .{self.api_key});
         defer allocator.free(auth_header);
 
-        const body = try std.fmt.allocPrint(allocator, "{{\"entity_id\":\"{s}\",\"appName\":\"{s}\"}}", .{ entity, app_for_v2 });
+        var v2_body_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer v2_body_buf.deinit(allocator);
+        try v2_body_buf.appendSlice(allocator, "{\"entity_id\":\"");
+        try appendJsonEscaped(&v2_body_buf, allocator, entity);
+        try v2_body_buf.appendSlice(allocator, "\",\"appName\":\"");
+        try appendJsonEscaped(&v2_body_buf, allocator, app_for_v2);
+        try v2_body_buf.appendSlice(allocator, "\"}");
+        const body = try v2_body_buf.toOwnedSlice(allocator);
         defer allocator.free(body);
 
         var argv_buf: [20][]const u8 = undefined;
@@ -315,14 +337,19 @@ pub const ComposioTool = struct {
         defer allocator.free(stderr);
 
         const term = try child.wait();
-        const success = term.Exited == 0;
-
-        if (success) {
-            const out = try allocator.dupe(u8, if (stdout.len > 0) stdout else "(empty response)");
-            return ToolResult{ .success = true, .output = out };
-        } else {
-            const err_out = try allocator.dupe(u8, if (stderr.len > 0) stderr else "curl failed with non-zero exit code");
-            return ToolResult{ .success = false, .output = "", .error_msg = err_out };
+        switch (term) {
+            .Exited => |code| {
+                if (code == 0) {
+                    const out = try allocator.dupe(u8, if (stdout.len > 0) stdout else "(empty response)");
+                    return ToolResult{ .success = true, .output = out };
+                } else {
+                    const err_out = try allocator.dupe(u8, if (stderr.len > 0) stderr else "curl failed with non-zero exit code");
+                    return ToolResult{ .success = false, .output = "", .error_msg = err_out };
+                }
+            },
+            else => {
+                return ToolResult{ .success = false, .output = "", .error_msg = "curl terminated by signal" };
+            },
         }
     }
 };
@@ -422,6 +449,20 @@ pub fn extractApiErrorMessage(allocator: std.mem.Allocator, body: []const u8) !?
     }
 
     return null;
+}
+
+/// Append a string to an ArrayList with JSON escaping (quotes, backslashes, control chars).
+fn appendJsonEscaped(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, input: []const u8) !void {
+    for (input) |c| {
+        switch (c) {
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            else => try out.append(allocator, c),
+        }
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
