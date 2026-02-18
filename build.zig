@@ -5,14 +5,25 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const default_include = if (builtin.os.tag == .macos) "/opt/homebrew/opt/sqlite/include" else "/usr/include";
-    const default_lib = if (builtin.os.tag == .macos) "/opt/homebrew/opt/sqlite/lib" else "/usr/lib";
-
     const sqlite_include: std.Build.LazyPath = .{
-        .cwd_relative = b.option([]const u8, "sqlite-include", "Path to SQLite include directory") orelse default_include,
+        .cwd_relative = b.option(
+            []const u8,
+            "sqlite-include",
+            "Path to SQLite include directory (default: /opt/homebrew/opt/sqlite/include on macOS, /usr/include on Linux)",
+        ) orelse switch (builtin.os.tag) {
+            .macos => "/opt/homebrew/opt/sqlite/include",
+            else => "/usr/include",
+        },
     };
     const sqlite_lib: std.Build.LazyPath = .{
-        .cwd_relative = b.option([]const u8, "sqlite-lib", "Path to SQLite lib directory") orelse default_lib,
+        .cwd_relative = b.option(
+            []const u8,
+            "sqlite-lib",
+            "Path to SQLite lib directory (default: /opt/homebrew/opt/sqlite/lib on macOS, /usr/lib/x86_64-linux-gnu on Linux)",
+        ) orelse switch (builtin.os.tag) {
+            .macos => "/opt/homebrew/opt/sqlite/lib",
+            else => "/usr/lib/x86_64-linux-gnu",
+        },
     };
 
     // ---------- library module (importable by consumers) ----------

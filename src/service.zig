@@ -242,7 +242,10 @@ fn runChecked(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     child.stderr_behavior = .Pipe;
     try child.spawn();
     const result = try child.wait();
-    if (result.Exited != 0) return error.CommandFailed;
+    switch (result) {
+        .Exited => |code| if (code != 0) return error.CommandFailed,
+        else => return error.CommandFailed,
+    }
 }
 
 fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {

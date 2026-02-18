@@ -108,6 +108,8 @@ pub const lark = @import("lark.zig");
 pub const dingtalk = @import("dingtalk.zig");
 pub const line = @import("line.zig");
 pub const onebot = @import("onebot.zig");
+pub const qq = @import("qq.zig");
+pub const maixcam = @import("maixcam.zig");
 pub const dispatch = @import("dispatch.zig");
 
 // ════════════════════════════════════════════════════════════════════════════
