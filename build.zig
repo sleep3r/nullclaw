@@ -51,9 +51,22 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addLibraryPath(sqlite_lib);
     exe.linkSystemLibrary2("sqlite3", .{});
     exe.linkLibC();
+    exe.dead_strip_dylibs = true;
+
+    if (optimize != .Debug) {
+        exe.root_module.strip = true;
+        exe.root_module.unwind_tables = .none;
+        exe.root_module.omit_frame_pointer = true;
+    }
 
     b.installArtifact(exe);
-    exe.root_module.strip = optimize != .Debug;
+
+    // macOS: strip local symbols post-install (Zig strip only removes debug info)
+    if (optimize != .Debug and builtin.os.tag == .macos) {
+        const strip_cmd = b.addSystemCommand(&.{ "strip", "-x", "zig-out/bin/nullclaw" });
+        strip_cmd.step.dependOn(b.getInstallStep());
+        b.default_step = &strip_cmd.step;
+    }
 
     // ---------- run step ----------
     const run_step = b.step("run", "Run nullclaw");

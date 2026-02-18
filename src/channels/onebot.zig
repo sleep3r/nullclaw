@@ -776,6 +776,9 @@ test "handleEvent non-message event ignored" {
 test "handleEvent invalid JSON" {
     const alloc = std.testing.allocator;
     var ch = OneBotChannel.init(alloc, .{});
+    // Suppress expected warnings from invalid input
+    std.testing.log_level = .err;
+    defer std.testing.log_level = .warn;
     // Should not crash on invalid JSON
     try ch.handleEvent("not json at all");
     try ch.handleEvent("{broken");

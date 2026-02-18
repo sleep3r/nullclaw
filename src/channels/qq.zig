@@ -962,6 +962,9 @@ test "qq handleGatewayEvent INVALID_SESSION sets running false" {
     const alloc = std.testing.allocator;
     var ch = QQChannel.init(alloc, .{});
     ch.running = true;
+    // Suppress expected warning from INVALID_SESSION opcode
+    std.testing.log_level = .err;
+    defer std.testing.log_level = .warn;
     try ch.handleGatewayEvent("{\"op\":9}");
     try std.testing.expect(!ch.running);
 }
@@ -976,6 +979,9 @@ test "qq handleGatewayEvent HEARTBEAT_ACK is silent" {
 test "qq handleGatewayEvent invalid JSON" {
     const alloc = std.testing.allocator;
     var ch = QQChannel.init(alloc, .{});
+    // Suppress expected warnings from invalid input
+    std.testing.log_level = .err;
+    defer std.testing.log_level = .warn;
     try ch.handleGatewayEvent("not json");
     try ch.handleGatewayEvent("{broken");
     try ch.handleGatewayEvent("");
