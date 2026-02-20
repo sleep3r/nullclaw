@@ -145,7 +145,7 @@ pub fn makeOutbound(
 }
 
 /// Create an OutboundMessage with media attachments.
-pub fn makeOutboundWithMedia(
+fn makeOutboundWithMedia(
     allocator: Allocator,
     channel: []const u8,
     chat_id: []const u8,

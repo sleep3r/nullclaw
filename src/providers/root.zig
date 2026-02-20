@@ -1115,9 +1115,6 @@ pub fn convertToolsAnthropic(buf: *std.ArrayListUnmanaged(u8), allocator: std.me
 /// Re-export shared HTTP POST utility (used by sub-modules via `root.curlPost`).
 pub const curlPost = http_util.curlPost;
 
-/// Re-export proxy/timeout-aware HTTP POST (used by providers for LLM calls).
-pub const curlPostWithProxy = http_util.curlPostWithProxy;
-
 /// HTTP POST with optional LLM timeout (seconds). 0 = no limit.
 pub fn curlPostTimed(allocator: std.mem.Allocator, url: []const u8, body: []const u8, headers: []const []const u8, timeout_secs: u64) ![]u8 {
     if (timeout_secs > 0) {
