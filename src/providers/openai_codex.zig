@@ -112,7 +112,7 @@ pub const OpenAiCodexProvider = struct {
         const body = try buildSimpleCodexBody(allocator, system_prompt, message, normalizeModel(model));
         defer allocator.free(body);
 
-        var auth_hdr_buf: [512]u8 = undefined;
+        var auth_hdr_buf: [2048]u8 = undefined;
         const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{token}) catch return error.CodexApiError;
 
         return codexRequest(allocator, CODEX_API_URL, body, auth_hdr, &.{});
@@ -131,7 +131,7 @@ pub const OpenAiCodexProvider = struct {
         const body = try buildCodexBody(allocator, null, request.messages, normalizeModel(model), request.reasoning_effort);
         defer allocator.free(body);
 
-        var auth_hdr_buf: [512]u8 = undefined;
+        var auth_hdr_buf: [2048]u8 = undefined;
         const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{token}) catch return error.CodexApiError;
 
         const content = try codexRequest(allocator, CODEX_API_URL, body, auth_hdr, &.{});
@@ -157,7 +157,7 @@ pub const OpenAiCodexProvider = struct {
         const body = try buildCodexBody(allocator, null, request.messages, normalizeModel(model), request.reasoning_effort);
         defer allocator.free(body);
 
-        var auth_hdr_buf: [512]u8 = undefined;
+        var auth_hdr_buf: [2048]u8 = undefined;
         const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{token}) catch return error.CodexApiError;
 
         return codexStreamRequest(allocator, CODEX_API_URL, body, auth_hdr, &.{}, callback, callback_ctx);
