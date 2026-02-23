@@ -45,13 +45,15 @@ pub const HttpRequestTool = struct {
         const default_port: u16 = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) 443 else 80;
         const resolved_port: u16 = uri.port orelse default_port;
 
-        // Block localhost/private IPs (SSRF protection)
+        // SSRF protection and DNS-rebinding hardening:
+        // resolve once, validate global address, and connect directly to it.
         const host = net_security.extractHost(url) orelse
             return ToolResult.fail("Invalid URL: cannot extract host");
-
-        if (net_security.isLocalHost(host) or net_security.hostResolvesToLocal(allocator, host, resolved_port)) {
-            return ToolResult.fail("Blocked local/private host");
-        }
+        const connect_host = net_security.resolveConnectHost(allocator, host, resolved_port) catch |err| switch (err) {
+            error.LocalAddressBlocked => return ToolResult.fail("Blocked local/private host"),
+            else => return ToolResult.fail("Unable to verify host safety"),
+        };
+        defer allocator.free(connect_host);
 
         // Check domain allowlist
         if (self.allowed_domains.len > 0) {
@@ -104,6 +106,19 @@ pub const HttpRequestTool = struct {
         var client: std.http.Client = .{ .allocator = allocator };
         defer client.deinit();
 
+        const protocol: std.http.Client.Protocol = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) .tls else .plain;
+        const authority_host = stripHostBrackets(host);
+        const connection = client.connectTcpOptions(.{
+            .host = connect_host,
+            .port = resolved_port,
+            .protocol = protocol,
+            .proxied_host = authority_host,
+            .proxied_port = resolved_port,
+        }) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "HTTP request failed: {}", .{err});
+            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        };
+
         const body: ?[]const u8 = root.getString(args, "body");
 
         // Build extra headers
@@ -115,7 +130,7 @@ pub const HttpRequestTool = struct {
             extra_count += 1;
         }
 
-        var req = client.request(method, uri, buildRequestOptions(extra_headers_buf[0..extra_count])) catch |err| {
+        var req = client.request(method, uri, buildRequestOptions(extra_headers_buf[0..extra_count], connection)) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "HTTP request failed: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
@@ -193,11 +208,22 @@ fn validateMethod(method: []const u8) ?std.http.Method {
 }
 
 /// Disable auto-follow redirects so every hop can be explicitly validated.
-fn buildRequestOptions(extra_headers: []const std.http.Header) std.http.Client.RequestOptions {
+fn buildRequestOptions(
+    extra_headers: []const std.http.Header,
+    connection: ?*std.http.Client.Connection,
+) std.http.Client.RequestOptions {
     return .{
         .extra_headers = extra_headers,
         .redirect_behavior = .unhandled,
+        .connection = connection,
     };
+}
+
+fn stripHostBrackets(host: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, host, "[") and std.mem.endsWith(u8, host, "]")) {
+        return host[1 .. host.len - 1];
+    }
+    return host;
 }
 
 /// Parse headers from a JSON object string: {"Key": "Value", ...}
@@ -381,8 +407,9 @@ test "isSensitiveHeader checks" {
 }
 
 test "http_request disables automatic redirects" {
-    const opts = buildRequestOptions(&.{});
+    const opts = buildRequestOptions(&.{}, null);
     try std.testing.expect(opts.redirect_behavior == .unhandled);
+    try std.testing.expect(opts.connection == null);
 }
 
 // ── execute-level tests ──────────────────────────────────────

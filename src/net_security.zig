@@ -90,16 +90,108 @@ pub fn isLocalHost(host: []const u8) bool {
     return false;
 }
 
+pub const ResolveConnectHostError = std.mem.Allocator.Error || error{
+    HostResolutionFailed,
+    LocalAddressBlocked,
+};
+
+/// Resolve host and return a concrete connect target (IP literal) that is
+/// guaranteed to be globally routable. If any resolved address is local/private,
+/// reject to prevent mixed-record SSRF bypasses.
+pub fn resolveConnectHost(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+) ResolveConnectHostError![]u8 {
+    const bare = stripHostBrackets(host);
+
+    const addr_list = std.net.getAddressList(allocator, bare, port) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.HostResolutionFailed,
+    };
+    defer addr_list.deinit();
+
+    var saw_addr = false;
+    var selected_v4: ?[4]u8 = null;
+    var selected_v6: ?[16]u8 = null;
+
+    for (addr_list.addrs) |addr| {
+        switch (addr.any.family) {
+            std.posix.AF.INET => {
+                const octets: *const [4]u8 = @ptrCast(&addr.in.sa.addr);
+                if (isNonGlobalV4(octets.*)) return error.LocalAddressBlocked;
+                if (!saw_addr) {
+                    selected_v4 = octets.*;
+                    saw_addr = true;
+                }
+            },
+            std.posix.AF.INET6 => {
+                const bytes = addr.in6.sa.addr;
+                const segs = [8]u16{
+                    (@as(u16, bytes[0]) << 8) | bytes[1],
+                    (@as(u16, bytes[2]) << 8) | bytes[3],
+                    (@as(u16, bytes[4]) << 8) | bytes[5],
+                    (@as(u16, bytes[6]) << 8) | bytes[7],
+                    (@as(u16, bytes[8]) << 8) | bytes[9],
+                    (@as(u16, bytes[10]) << 8) | bytes[11],
+                    (@as(u16, bytes[12]) << 8) | bytes[13],
+                    (@as(u16, bytes[14]) << 8) | bytes[15],
+                };
+                if (isNonGlobalV6(segs)) return error.LocalAddressBlocked;
+                if (!saw_addr) {
+                    selected_v6 = bytes;
+                    saw_addr = true;
+                }
+            },
+            else => {},
+        }
+    }
+
+    if (!saw_addr) return error.HostResolutionFailed;
+
+    if (selected_v4) |octets| {
+        return std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}", .{
+            octets[0],
+            octets[1],
+            octets[2],
+            octets[3],
+        });
+    }
+
+    if (selected_v6) |bytes| {
+        const segs = [8]u16{
+            (@as(u16, bytes[0]) << 8) | bytes[1],
+            (@as(u16, bytes[2]) << 8) | bytes[3],
+            (@as(u16, bytes[4]) << 8) | bytes[5],
+            (@as(u16, bytes[6]) << 8) | bytes[7],
+            (@as(u16, bytes[8]) << 8) | bytes[9],
+            (@as(u16, bytes[10]) << 8) | bytes[11],
+            (@as(u16, bytes[12]) << 8) | bytes[13],
+            (@as(u16, bytes[14]) << 8) | bytes[15],
+        };
+        return std.fmt.allocPrint(allocator, "{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}", .{
+            segs[0],
+            segs[1],
+            segs[2],
+            segs[3],
+            segs[4],
+            segs[5],
+            segs[6],
+            segs[7],
+        });
+    }
+
+    return error.HostResolutionFailed;
+}
+
 /// Resolve hostname and reject if any resolved IP is local/private/reserved.
 /// This closes SSRF bypasses via numeric host aliases (e.g. 2130706433) and
 /// DNS rebinding-style domains that resolve to loopback/private addresses.
 pub fn hostResolvesToLocal(allocator: std.mem.Allocator, host: []const u8, port: u16) bool {
-    const bare = if (std.mem.startsWith(u8, host, "[") and std.mem.endsWith(u8, host, "]"))
-        host[1 .. host.len - 1]
-    else
-        host;
+    const bare = stripHostBrackets(host);
 
-    const addr_list = std.net.getAddressList(allocator, bare, port) catch return false;
+    // Fail closed: if we cannot verify DNS resolution safety, treat host as local.
+    const addr_list = std.net.getAddressList(allocator, bare, port) catch return true;
     defer addr_list.deinit();
 
     for (addr_list.addrs) |addr| {
@@ -126,6 +218,13 @@ pub fn hostResolvesToLocal(allocator: std.mem.Allocator, host: []const u8, port:
         }
     }
     return false;
+}
+
+fn stripHostBrackets(host: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, host, "[") and std.mem.endsWith(u8, host, "]")) {
+        return host[1 .. host.len - 1];
+    }
+    return host;
 }
 
 /// Returns true if the IPv4 address is not globally routable.
@@ -586,4 +685,9 @@ test "URL extraction works correctly" {
 test "hostResolvesToLocal blocks decimal and hex loopback aliases" {
     try std.testing.expect(hostResolvesToLocal(std.testing.allocator, "2130706433", 80));
     try std.testing.expect(hostResolvesToLocal(std.testing.allocator, "0x7f000001", 80));
+}
+
+test "resolveConnectHost rejects loopback aliases" {
+    try std.testing.expectError(error.LocalAddressBlocked, resolveConnectHost(std.testing.allocator, "2130706433", 80));
+    try std.testing.expectError(error.LocalAddressBlocked, resolveConnectHost(std.testing.allocator, "0x7f000001", 80));
 }
