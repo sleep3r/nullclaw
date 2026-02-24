@@ -1002,10 +1002,8 @@ pub const TelegramChannel = struct {
         var media_group_ids: std.ArrayListUnmanaged(?[]const u8) = .empty;
         errdefer {
             for (messages.items) |msg| {
-                allocator.free(msg.id);
-                allocator.free(msg.sender);
-                allocator.free(msg.content);
-                if (msg.first_name) |fn_| allocator.free(fn_);
+                var tmp = msg;
+                tmp.deinit(allocator);
             }
             messages.deinit(allocator);
             for (media_group_ids.items) |mg| if (mg) |s| allocator.free(s);
@@ -1366,10 +1364,8 @@ pub const TelegramChannel = struct {
         media_group_ids.append(allocator, mg_dup) catch {
             // Rollback to keep messages and media_group_ids synchronized
             const popped = messages.pop().?;
-            allocator.free(popped.id);
-            allocator.free(popped.sender);
-            allocator.free(popped.content);
-            if (popped.first_name) |f| allocator.free(f);
+            var tmp = popped;
+            tmp.deinit(allocator);
             if (mg_dup) |m| allocator.free(m);
             return;
         };
