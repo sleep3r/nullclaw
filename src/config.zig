@@ -330,16 +330,21 @@ pub const Config = struct {
     fn writeMcpServersSection(self: *const Config, w: *std.Io.Writer) !void {
         try w.print("  \"mcp_servers\": {{\n", .{});
         for (self.mcp_servers, 0..) |server, i| {
-            try w.print("    \"{s}\": {{\"command\": \"{s}\"", .{ server.name, server.command });
+            try w.print("    {f}: {{\"command\": {f}", .{
+                std.json.fmt(server.name, .{}),
+                std.json.fmt(server.command, .{}),
+            });
             if (server.args.len > 0) {
-                try w.print(", \"args\": ", .{});
-                try writeStringArray(w, server.args);
+                try w.print(", \"args\": {f}", .{std.json.fmt(server.args, .{})});
             }
             if (server.env.len > 0) {
                 try w.print(", \"env\": {{", .{});
                 for (server.env, 0..) |entry, env_i| {
                     if (env_i > 0) try w.print(", ", .{});
-                    try w.print("\"{s}\": \"{s}\"", .{ entry.key, entry.value });
+                    try w.print("{f}: {f}", .{
+                        std.json.fmt(entry.key, .{}),
+                        std.json.fmt(entry.value, .{}),
+                    });
                 }
                 try w.print("}}", .{});
             }
@@ -1267,6 +1272,66 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqualStrings("/dev/tty.usbmodem1", loaded.hardware.serial_port.?);
     try std.testing.expectEqual(config_types.DmScope.per_peer, loaded.session.dm_scope);
     try std.testing.expectEqual(@as(usize, 1), loaded.session.identity_links.len);
+}
+
+test "save escapes mcp_servers strings safely" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.default_model = "gpt-5";
+    cfg.mcp_servers = &.{
+        .{
+            .name = "ctx\"7",
+            .command = "npx \"@scope/pkg\"\nrun",
+            .args = &.{
+                "--path=C:\\tmp\\file",
+                "line\nbreak",
+            },
+            .env = &.{
+                .{
+                    .key = "OPEN\"KEY",
+                    .value = "ab\\cd\"ef\nz",
+                },
+            },
+        },
+    };
+
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 128 * 1024);
+    defer allocator.free(content);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.mcp_servers.len);
+    try std.testing.expectEqualStrings("ctx\"7", loaded.mcp_servers[0].name);
+    try std.testing.expectEqualStrings("npx \"@scope/pkg\"\nrun", loaded.mcp_servers[0].command);
+    try std.testing.expectEqual(@as(usize, 2), loaded.mcp_servers[0].args.len);
+    try std.testing.expectEqualStrings("--path=C:\\tmp\\file", loaded.mcp_servers[0].args[0]);
+    try std.testing.expectEqualStrings("line\nbreak", loaded.mcp_servers[0].args[1]);
+    try std.testing.expectEqual(@as(usize, 1), loaded.mcp_servers[0].env.len);
+    try std.testing.expectEqualStrings("OPEN\"KEY", loaded.mcp_servers[0].env[0].key);
+    try std.testing.expectEqualStrings("ab\\cd\"ef\nz", loaded.mcp_servers[0].env[0].value);
 }
 
 test "syncFlatFields propagates nested values" {
