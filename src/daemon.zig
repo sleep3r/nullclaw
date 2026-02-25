@@ -18,7 +18,6 @@ const channel_manager = @import("channel_manager.zig");
 const agent_routing = @import("agent_routing.zig");
 const channel_catalog = @import("channel_catalog.zig");
 const channel_adapters = @import("channel_adapters.zig");
-const channels_mod = @import("channels/root.zig");
 
 const log = std.log.scoped(.daemon);
 
@@ -487,12 +486,6 @@ fn resolveInboundRouteSessionKey(
     return resolveInboundRouteSessionKeyWithMetadata(allocator, config, msg, parsed_meta.fields);
 }
 
-const InboundIndicatorMode = enum {
-    none,
-    slack_status,
-    discord_typing,
-};
-
 const SlackStatusTarget = struct {
     channel_id: []const u8,
     thread_ts: []const u8,
@@ -514,74 +507,61 @@ fn resolveSlackStatusTarget(meta: channel_adapters.InboundMetadata, chat_id: []c
     };
 }
 
+fn resolveTypingRecipient(
+    allocator: std.mem.Allocator,
+    channel_name: []const u8,
+    chat_id: []const u8,
+    meta: channel_adapters.InboundMetadata,
+) ?[]u8 {
+    if (std.mem.eql(u8, channel_name, "slack")) {
+        const slack_target = resolveSlackStatusTarget(meta, chat_id) orelse return null;
+        return std.fmt.allocPrint(allocator, "{s}:{s}", .{ slack_target.channel_id, slack_target.thread_ts }) catch null;
+    }
+
+    if (!std.mem.eql(u8, channel_name, "discord") and !std.mem.eql(u8, channel_name, "mattermost")) {
+        return null;
+    }
+    if (chat_id.len == 0) return null;
+    return allocator.dupe(u8, chat_id) catch null;
+}
+
 fn sendInboundProcessingIndicator(
+    allocator: std.mem.Allocator,
     registry: *const dispatch.ChannelRegistry,
     channel_name: []const u8,
     account_id: ?[]const u8,
     chat_id: []const u8,
     meta: channel_adapters.InboundMetadata,
-) InboundIndicatorMode {
+) ?[]u8 {
     const channel_opt = if (account_id) |aid|
         registry.findByNameAccount(channel_name, aid)
     else
         registry.findByName(channel_name);
-    const ch = channel_opt orelse return .none;
+    const ch = channel_opt orelse return null;
 
-    if (std.mem.eql(u8, channel_name, "discord")) {
-        const discord_ch: *channels_mod.discord.DiscordChannel = @ptrCast(@alignCast(ch.ptr));
-        discord_ch.typing_indicator.start(discord_ch, chat_id);
-        return .discord_typing;
-    }
-
-    if (std.mem.eql(u8, channel_name, "mattermost")) {
-        const mm_ch: *channels_mod.mattermost.MattermostChannel = @ptrCast(@alignCast(ch.ptr));
-        mm_ch.sendTypingIndicator(chat_id);
-        return .none;
-    }
-
-    if (std.mem.eql(u8, channel_name, "slack")) {
-        const slack_target = resolveSlackStatusTarget(meta, chat_id) orelse return .none;
-        const slack_ch: *channels_mod.slack.SlackChannel = @ptrCast(@alignCast(ch.ptr));
-        slack_ch.setThreadStatus(slack_target.channel_id, slack_target.thread_ts, "is typing...");
-        return .slack_status;
-    }
-
-    return .none;
+    const recipient = resolveTypingRecipient(allocator, channel_name, chat_id, meta) orelse return null;
+    ch.startTyping(recipient) catch {
+        allocator.free(recipient);
+        return null;
+    };
+    return recipient;
 }
 
 fn clearInboundProcessingIndicator(
+    allocator: std.mem.Allocator,
     registry: *const dispatch.ChannelRegistry,
     channel_name: []const u8,
     account_id: ?[]const u8,
-    chat_id: []const u8,
-    meta: channel_adapters.InboundMetadata,
-    mode: InboundIndicatorMode,
+    recipient: ?[]u8,
 ) void {
-    if (mode == .none) return;
-
-    if (mode == .discord_typing) {
-        const channel_opt = if (account_id) |aid|
-            registry.findByNameAccount(channel_name, aid)
-        else
-            registry.findByName(channel_name);
-        if (channel_opt) |ch| {
-            const discord_ch: *channels_mod.discord.DiscordChannel = @ptrCast(@alignCast(ch.ptr));
-            discord_ch.typing_indicator.stop();
-        }
-        return;
-    }
-
-    if (!std.mem.eql(u8, channel_name, "slack")) return;
-
-    const slack_target = resolveSlackStatusTarget(meta, chat_id) orelse return;
+    const target = recipient orelse return;
+    defer allocator.free(target);
     const channel_opt = if (account_id) |aid|
         registry.findByNameAccount(channel_name, aid)
     else
         registry.findByName(channel_name);
     const ch = channel_opt orelse return;
-
-    const slack_ch: *channels_mod.slack.SlackChannel = @ptrCast(@alignCast(ch.ptr));
-    slack_ch.setThreadStatus(slack_target.channel_id, slack_target.thread_ts, "");
+    ch.stopTyping(target) catch {};
 }
 
 fn inboundDispatcherThread(
@@ -609,7 +589,8 @@ fn inboundDispatcherThread(
         defer if (routed_session_key) |key| allocator.free(key);
         const session_key = routed_session_key orelse msg.session_key;
 
-        const indicator_mode = sendInboundProcessingIndicator(
+        const typing_recipient = sendInboundProcessingIndicator(
+            allocator,
             registry,
             msg.channel,
             outbound_account_id,
@@ -617,12 +598,11 @@ fn inboundDispatcherThread(
             parsed_meta.fields,
         );
         defer clearInboundProcessingIndicator(
+            allocator,
             registry,
             msg.channel,
             outbound_account_id,
-            msg.chat_id,
-            parsed_meta.fields,
-            indicator_mode,
+            typing_recipient,
         );
 
         const reply = runtime.session_mgr.processMessage(session_key, msg.content) catch |err| {
@@ -763,10 +743,14 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     // Channel runtime for supervised polling (provider, tools, sessions)
     var channel_rt: ?*channel_loop.ChannelRuntime = null;
     if (has_runtime_dependent_channels) {
-        channel_rt = channel_loop.ChannelRuntime.init(allocator, config) catch |err| {
+        channel_rt = channel_loop.ChannelRuntime.init(allocator, config) catch |err| blk: {
             state.markError("channels", @errorName(err));
             health.markComponentError("channels", "runtime init failed");
-            return err;
+            stdout.print(
+                "Warning: channel runtime init failed ({s}); runtime-dependent channels disabled.\n",
+                .{@errorName(err)},
+            ) catch {};
+            break :blk null;
         };
     }
     defer if (channel_rt) |rt| rt.deinit();

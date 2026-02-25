@@ -1333,7 +1333,6 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     session_mgr.policy = &sec_policy;
     defer session_mgr.deinit();
 
-    var typing = yc.channels.telegram.TypingIndicator.init(&tg);
     var evict_counter: u32 = 0;
 
     // Bot loop: poll → full agent loop (tool calling) → reply
@@ -1385,11 +1384,12 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
                 break :blk route.session_key;
             };
 
-            // Start periodic typing indicator while LLM is thinking
-            typing.start(msg.sender);
+            // Start periodic typing indicator while the model is processing
+            const typing_target = msg.sender;
+            tg.startTyping(typing_target) catch {};
+            defer tg.stopTyping(typing_target) catch {};
 
             const reply = session_mgr.processMessage(session_key, msg.content) catch |err| {
-                typing.stop();
                 std.debug.print("  Agent error: {}\n", .{err});
                 const err_msg = switch (err) {
                     error.CurlFailed, error.CurlReadError, error.CurlWaitError => "Network error. Please try again.",
@@ -1402,8 +1402,6 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
                 continue;
             };
             defer allocator.free(reply);
-
-            typing.stop();
 
             std.debug.print("  -> {s}\n", .{reply});
 
