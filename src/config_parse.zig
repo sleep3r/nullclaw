@@ -655,6 +655,21 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
+    // Cron
+    if (root.get("cron")) |cr| {
+        if (cr == .object) {
+            if (cr.object.get("enabled")) |v| {
+                if (v == .bool) self.cron.enabled = v.bool;
+            }
+            if (cr.object.get("interval_minutes")) |v| {
+                if (v == .integer) self.cron.interval_minutes = @intCast(v.integer);
+            }
+            if (cr.object.get("max_run_history")) |v| {
+                if (v == .integer) self.cron.max_run_history = @intCast(v.integer);
+            }
+        }
+    }
+
     // Agent
     if (root.get("agent")) |ag| {
         if (ag == .object) {
@@ -684,6 +699,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (ag.object.get("compaction_max_source_chars")) |v| {
                 if (v == .integer) self.agent.compaction_max_source_chars = @intCast(v.integer);
+            }
+            if (ag.object.get("token_limit")) |v| {
+                if (v == .integer) self.agent.token_limit = @intCast(v.integer);
             }
             if (ag.object.get("message_timeout_secs")) |v| {
                 if (v == .integer) self.agent.message_timeout_secs = @intCast(v.integer);
@@ -1366,6 +1384,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (hr.object.get("timeout_secs")) |v| {
                 if (v == .integer) self.http_request.timeout_secs = @intCast(v.integer);
             }
+            if (hr.object.get("allowed_domains")) |v| {
+                if (v == .array) self.http_request.allowed_domains = try parseStringArray(self.allocator, v.array);
+            }
         }
     }
 
@@ -1447,6 +1468,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     if (res.object.get("max_memory_mb")) |v| {
                         if (v == .integer) self.security.resources.max_memory_mb = @intCast(v.integer);
                     }
+                    if (res.object.get("max_cpu_percent")) |v| {
+                        if (v == .integer) self.security.resources.max_cpu_percent = @intCast(v.integer);
+                    }
+                    if (res.object.get("max_disk_mb")) |v| {
+                        if (v == .integer) self.security.resources.max_disk_mb = @intCast(v.integer);
+                    }
                     if (res.object.get("max_cpu_time_seconds")) |v| {
                         if (v == .integer) self.security.resources.max_cpu_time_seconds = @intCast(v.integer);
                     }
@@ -1465,6 +1492,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     }
                     if (aud.object.get("log_path")) |v| {
                         if (v == .string) self.security.audit.log_path = try self.allocator.dupe(u8, v.string);
+                    }
+                    if (aud.object.get("retention_days")) |v| {
+                        if (v == .integer) self.security.audit.retention_days = @intCast(v.integer);
                     }
                     if (aud.object.get("max_size_mb")) |v| {
                         if (v == .integer) self.security.audit.max_size_mb = @intCast(v.integer);

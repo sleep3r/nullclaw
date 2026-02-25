@@ -214,10 +214,12 @@ pub fn buildAutoChain(
     // Determine primary from fallback_name or default to openai
     const effective_primary = fallback_name orelse "openai";
     const primary = try embeddings.createEmbeddingProvider(allocator, effective_primary, api_key, model, dims);
+    errdefer primary.deinit();
 
     // Add noop as final fallback (always available)
     const noop_inst = try allocator.create(embeddings.NoopEmbedding);
     noop_inst.* = .{ .allocator = allocator };
+    errdefer noop_inst.provider().deinit();
     try chain.append(allocator, noop_inst.provider());
 
     var router = try ProviderRouter.init(allocator, primary, chain.items, &.{});

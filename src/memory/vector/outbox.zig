@@ -126,10 +126,14 @@ pub const VectorOutbox = struct {
                     const key_slice: []const u8 = @as([*]const u8, @ptrCast(key_ptr))[0..key_len];
                     const op_slice: []const u8 = @as([*]const u8, @ptrCast(op_ptr))[0..op_len];
 
+                    const owned_key = try allocator.dupe(u8, key_slice);
+                    errdefer allocator.free(owned_key);
+                    const owned_op = try allocator.dupe(u8, op_slice);
+                    errdefer allocator.free(owned_op);
                     try items.append(allocator, .{
                         .id = id,
-                        .key = try allocator.dupe(u8, key_slice),
-                        .op = try allocator.dupe(u8, op_slice),
+                        .key = owned_key,
+                        .op = owned_op,
                     });
                 } else break;
             }

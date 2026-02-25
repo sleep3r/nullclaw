@@ -7,6 +7,7 @@
 //!   - Factory function: createEmbeddingProvider()
 
 const std = @import("std");
+const appendJsonEscaped = @import("../../util.zig").appendJsonEscaped;
 const GeminiEmbedding = @import("embeddings_gemini.zig").GeminiEmbedding;
 const VoyageEmbedding = @import("embeddings_voyage.zig").VoyageEmbedding;
 const OllamaEmbedding = @import("embeddings_ollama.zig").OllamaEmbedding;
@@ -159,34 +160,9 @@ pub const OpenAiEmbedding = struct {
         defer body_buf.deinit(allocator);
 
         try body_buf.appendSlice(allocator, "{\"model\":\"");
-        // Escape model name
-        for (self_.model) |ch| {
-            if (ch == '"') {
-                try body_buf.appendSlice(allocator, "\\\"");
-            } else {
-                try body_buf.append(allocator, ch);
-            }
-        }
+        try appendJsonEscaped(&body_buf, allocator, self_.model);
         try body_buf.appendSlice(allocator, "\",\"input\":\"");
-        // Escape text
-        for (text) |ch| {
-            switch (ch) {
-                '"' => try body_buf.appendSlice(allocator, "\\\""),
-                '\\' => try body_buf.appendSlice(allocator, "\\\\"),
-                '\n' => try body_buf.appendSlice(allocator, "\\n"),
-                '\r' => try body_buf.appendSlice(allocator, "\\r"),
-                '\t' => try body_buf.appendSlice(allocator, "\\t"),
-                else => {
-                    if (ch < 0x20) {
-                        var hex_buf: [6]u8 = undefined;
-                        const hex = std.fmt.bufPrint(&hex_buf, "\\u{x:0>4}", .{ch}) catch continue;
-                        try body_buf.appendSlice(allocator, hex);
-                    } else {
-                        try body_buf.append(allocator, ch);
-                    }
-                },
-            }
-        }
+        try appendJsonEscaped(&body_buf, allocator, text);
         try body_buf.appendSlice(allocator, "\"}");
 
         const url = try self_.embeddingsUrl(allocator);
@@ -268,8 +244,11 @@ fn parseEmbeddingResponse(allocator: std.mem.Allocator, json_bytes: []const u8) 
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{}) catch return error.InvalidEmbeddingResponse;
     defer parsed.deinit();
 
-    const root = parsed.value;
-    const data = root.object.get("data") orelse return error.InvalidEmbeddingResponse;
+    const root = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidEmbeddingResponse,
+    };
+    const data = root.get("data") orelse return error.InvalidEmbeddingResponse;
     const data_array = switch (data) {
         .array => |a| a,
         else => return error.InvalidEmbeddingResponse,

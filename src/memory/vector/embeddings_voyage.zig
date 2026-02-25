@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const EmbeddingProvider = @import("embeddings.zig").EmbeddingProvider;
+const appendJsonEscaped = @import("../../util.zig").appendJsonEscaped;
 
 pub const VoyageEmbedding = struct {
     allocator: std.mem.Allocator,
@@ -70,7 +71,7 @@ pub const VoyageEmbedding = struct {
         try body_buf.appendSlice(allocator, "\",\"input\":[\"");
         try appendJsonEscaped(&body_buf, allocator, text);
         try body_buf.appendSlice(allocator, "\"],\"input_type\":\"");
-        try body_buf.appendSlice(allocator, input_type);
+        try appendJsonEscaped(&body_buf, allocator, input_type);
         try body_buf.appendSlice(allocator, "\"}");
 
         return allocator.dupe(u8, body_buf.items);
@@ -154,8 +155,11 @@ pub fn parseVoyageResponse(allocator: std.mem.Allocator, json_bytes: []const u8)
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{}) catch return error.InvalidEmbeddingResponse;
     defer parsed.deinit();
 
-    const root = parsed.value;
-    const data = root.object.get("data") orelse return error.InvalidEmbeddingResponse;
+    const root = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidEmbeddingResponse,
+    };
+    const data = root.get("data") orelse return error.InvalidEmbeddingResponse;
     const data_array = switch (data) {
         .array => |a| a,
         else => return error.InvalidEmbeddingResponse,
@@ -181,27 +185,6 @@ pub fn parseVoyageResponse(allocator: std.mem.Allocator, json_bytes: []const u8)
         };
     }
     return result;
-}
-
-fn appendJsonEscaped(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, text: []const u8) !void {
-    for (text) |ch| {
-        switch (ch) {
-            '"' => try buf.appendSlice(allocator, "\\\""),
-            '\\' => try buf.appendSlice(allocator, "\\\\"),
-            '\n' => try buf.appendSlice(allocator, "\\n"),
-            '\r' => try buf.appendSlice(allocator, "\\r"),
-            '\t' => try buf.appendSlice(allocator, "\\t"),
-            else => {
-                if (ch < 0x20) {
-                    var hex_buf: [6]u8 = undefined;
-                    const hex = std.fmt.bufPrint(&hex_buf, "\\u{x:0>4}", .{ch}) catch continue;
-                    try buf.appendSlice(allocator, hex);
-                } else {
-                    try buf.append(allocator, ch);
-                }
-            },
-        }
-    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────

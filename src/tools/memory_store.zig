@@ -31,9 +31,11 @@ pub const MemoryStoreTool = struct {
     pub fn execute(self: *MemoryStoreTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const key = root.getString(args, "key") orelse
             return ToolResult.fail("Missing 'key' parameter");
+        if (key.len == 0) return ToolResult.fail("'key' must not be empty");
 
         const content = root.getString(args, "content") orelse
             return ToolResult.fail("Missing 'content' parameter");
+        if (content.len == 0) return ToolResult.fail("'content' must not be empty");
 
         const category_str = root.getString(args, "category") orelse "core";
         const category = MemoryCategory.fromString(category_str);

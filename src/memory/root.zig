@@ -836,6 +836,7 @@ pub fn initRuntime(
                 allocator.destroy(eng);
             }
             instance.memory.deinit();
+            if (cfg.postgres_url) |pu| allocator.free(std.mem.span(pu));
             if (cfg.db_path) |p| allocator.free(std.mem.span(p));
             return null;
         }

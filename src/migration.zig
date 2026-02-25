@@ -180,17 +180,10 @@ pub fn migrateOpenclawWithPolicy(
 
 // ── Content hashing ─────────────────────────────────────────────
 
-/// Compare two content strings using SHA-256 digest for fast equality check.
-/// For short strings (<=64 bytes), falls back to direct comparison to avoid
-/// hash overhead.
+/// Compare two content strings for equality.
+/// Direct comparison is both faster and correct (no hash collision risk).
 fn contentEqual(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    if (a.len <= 64) return std.mem.eql(u8, a, b);
-    var ha: [32]u8 = undefined;
-    var hb: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(a, &ha, .{});
-    std.crypto.hash.sha2.Sha256.hash(b, &hb, .{});
-    return std.mem.eql(u8, &ha, &hb);
+    return std.mem.eql(u8, a, b);
 }
 
 /// Produce a short hex hash (first 8 hex chars of SHA-256) for deterministic

@@ -219,14 +219,14 @@ pub const SemanticCache = struct {
 
             const sim = vector_math.cosineSimilarity(query_emb, cached_emb);
             if (sim > best_sim and sim >= self.similarity_threshold) {
-                if (best_response) |br| allocator.free(br);
-                best_response = null;
-
                 const resp_raw = c.sqlite3_column_text(stmt.?, 1);
                 const resp_len: usize = @intCast(c.sqlite3_column_bytes(stmt.?, 1));
                 if (resp_raw == null or resp_len == 0) continue;
 
-                best_response = allocator.dupe(u8, @as([*]const u8, @ptrCast(resp_raw))[0..resp_len]) catch continue;
+                const new_response = allocator.dupe(u8, @as([*]const u8, @ptrCast(resp_raw))[0..resp_len]) catch continue;
+                // Only update best after successful allocation to avoid losing previous match
+                if (best_response) |br| allocator.free(br);
+                best_response = new_response;
                 best_sim = sim;
                 best_id = id;
             }
@@ -394,7 +394,7 @@ pub const SemanticCache = struct {
 /// Serialize f32 slice to JSON array string: "[0.1,0.2,0.3]"
 pub fn serializeEmbedding(allocator: std.mem.Allocator, embedding: []const f32) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer buf.deinit(allocator);
+    errdefer buf.deinit(allocator);
 
     try buf.append(allocator, '[');
     for (embedding, 0..) |val, i| {
@@ -405,7 +405,7 @@ pub fn serializeEmbedding(allocator: std.mem.Allocator, embedding: []const f32) 
     }
     try buf.append(allocator, ']');
 
-    return allocator.dupe(u8, buf.items);
+    return buf.toOwnedSlice(allocator);
 }
 
 /// Deserialize JSON array string to f32 slice.

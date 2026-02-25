@@ -178,11 +178,11 @@ pub fn pruneConversationRows(allocator: std.mem.Allocator, mem: Memory, retentio
 
     // Search for conversation-tagged entries
     const results = mem.search(allocator, "conversation", 1000) catch return 0;
-    if (results.len == 0) return 0;
     defer {
         for (results) |r| r.deinit(allocator);
         allocator.free(results);
     }
+    if (results.len == 0) return 0;
 
     var pruned: u64 = 0;
     for (results) |entry| {

@@ -48,7 +48,7 @@ pub const CircuitBreaker = struct {
 
     /// Record failed operation. Increments counter, trips to open at threshold.
     pub fn recordFailure(self: *CircuitBreaker) void {
-        self.failure_count += 1;
+        self.failure_count +|= 1;
         self.last_failure_ns = std.time.nanoTimestamp();
 
         if (self.state == .half_open or (self.state == .closed and self.failure_count >= self.threshold)) {

@@ -138,6 +138,7 @@ fn cloneCandidate(allocator: Allocator, src: RetrievalCandidate, final_score: f6
         .source_path = source_path,
         .start_line = src.start_line,
         .end_line = src.end_line,
+        .created_at = src.created_at,
     };
 }
 

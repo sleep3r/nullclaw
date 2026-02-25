@@ -58,12 +58,17 @@ pub fn expandQuery(allocator: Allocator, raw_query: []const u8) !ExpandedQuery {
     // Tokenize
     var orig_list: std.ArrayListUnmanaged([]const u8) = .{};
     defer orig_list.deinit(allocator);
+    errdefer for (orig_list.items) |t| allocator.free(t);
     var filt_list: std.ArrayListUnmanaged([]const u8) = .{};
     defer filt_list.deinit(allocator);
+    errdefer for (filt_list.items) |t| allocator.free(t);
 
     // Tokenize into raw segments
     var raw_tokens: std.ArrayListUnmanaged([]const u8) = .{};
-    defer raw_tokens.deinit(allocator);
+    defer {
+        for (raw_tokens.items) |t| allocator.free(t);
+        raw_tokens.deinit(allocator);
+    }
     try tokenize(allocator, trimmed, lang, &raw_tokens);
 
     // Track original tokens (lowercased raw segments from whitespace split)
@@ -73,23 +78,30 @@ pub fn expandQuery(allocator: Allocator, raw_query: []const u8) !ExpandedQuery {
             const t = std.mem.trim(u8, seg, " \t\n\r");
             if (t.len == 0) continue;
             const low = try toLower(allocator, t);
+            errdefer allocator.free(low);
             try orig_list.append(allocator, low);
         }
     }
 
     // Filter tokens: remove stopwords, invalid keywords, and deduplicate
     var seen = std.StringHashMap(void).init(allocator);
-    defer seen.deinit();
+    defer {
+        var it = seen.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+        seen.deinit();
+    }
 
     for (raw_tokens.items) |token| {
-        defer allocator.free(token);
-
         if (isStopWord(token)) continue;
         if (!isValidKeyword(token)) continue;
         if (seen.contains(token)) continue;
 
-        try seen.put(try allocator.dupe(u8, token), {});
-        try filt_list.append(allocator, try allocator.dupe(u8, token));
+        const seen_key = try allocator.dupe(u8, token);
+        errdefer allocator.free(seen_key);
+        try seen.put(seen_key, {});
+        const filt_token = try allocator.dupe(u8, token);
+        errdefer allocator.free(filt_token);
+        try filt_list.append(allocator, filt_token);
     }
 
     // Build FTS5 query
@@ -97,19 +109,21 @@ pub fn expandQuery(allocator: Allocator, raw_query: []const u8) !ExpandedQuery {
         try allocator.dupe(u8, trimmed) // fallback to original
     else
         try buildFts5Query(allocator, filt_list.items);
+    errdefer allocator.free(fts5);
 
-    // Clean up seen map keys (duped separately from filt_list)
-    {
-        var it = seen.iterator();
-        while (it.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-        }
+    // seen map keys are freed by the defer block above
+
+    const orig_tokens = try orig_list.toOwnedSlice(allocator);
+    errdefer {
+        for (orig_tokens) |t| allocator.free(t);
+        allocator.free(orig_tokens);
     }
+    const filt_tokens = try filt_list.toOwnedSlice(allocator);
 
     return .{
         .fts5_query = fts5,
-        .original_tokens = try orig_list.toOwnedSlice(allocator),
-        .filtered_tokens = try filt_list.toOwnedSlice(allocator),
+        .original_tokens = orig_tokens,
+        .filtered_tokens = filt_tokens,
         .language = lang,
     };
 }

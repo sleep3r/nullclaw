@@ -135,6 +135,8 @@ pub const SessionManager = struct {
             .turn_count = 0,
             .mutex = .{},
         };
+        // From here, session owns agent — must deinit on error.
+        errdefer session.agent.deinit();
 
         // Restore persisted conversation history from session store
         if (self.session_store) |store| {

@@ -149,7 +149,7 @@ pub const LucidMemory = struct {
 
         var child = std.process.Child.init(argv_buf, self.allocator);
         child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Pipe;
+        child.stderr_behavior = .Ignore;
 
         child.spawn() catch return null;
 

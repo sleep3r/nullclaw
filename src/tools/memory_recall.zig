@@ -33,9 +33,10 @@ pub const MemoryRecallTool = struct {
     pub fn execute(self: *MemoryRecallTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const query = root.getString(args, "query") orelse
             return ToolResult.fail("Missing 'query' parameter");
+        if (query.len == 0) return ToolResult.fail("'query' must not be empty");
 
         const limit_raw = root.getInt(args, "limit") orelse 5;
-        const limit: usize = if (limit_raw > 0) @intCast(limit_raw) else 5;
+        const limit: usize = if (limit_raw > 0 and limit_raw <= 100) @intCast(limit_raw) else 5;
 
         const m = self.memory orelse {
             const msg = try std.fmt.allocPrint(allocator, "Memory backend not configured. Cannot search for: {s}", .{query});

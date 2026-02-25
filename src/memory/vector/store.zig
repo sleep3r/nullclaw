@@ -165,6 +165,7 @@ pub const SqliteSharedVectorStore = struct {
 
                 const score = vector.cosineSimilarity(query_embedding, row_vec);
                 const owned_key = try alloc.dupe(u8, key_ptr[0..key_len]);
+                errdefer alloc.free(owned_key);
 
                 try candidates.append(alloc, .{
                     .key = owned_key,

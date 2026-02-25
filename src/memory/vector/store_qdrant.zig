@@ -10,6 +10,7 @@ const store_mod = @import("store.zig");
 const VectorStore = store_mod.VectorStore;
 const VectorResult = store_mod.VectorResult;
 const HealthStatus = store_mod.HealthStatus;
+const appendJsonEscaped = @import("../../util.zig").appendJsonEscaped;
 
 // ── Config ────────────────────────────────────────────────────────
 
@@ -52,6 +53,7 @@ pub const QdrantVectorStore = struct {
         const owned_key = if (config.api_key) |k| try allocator.dupe(u8, k) else null;
         errdefer if (owned_key) |k| allocator.free(k);
         const owned_name = try allocator.dupe(u8, config.collection_name);
+        errdefer allocator.free(owned_name);
 
         self.* = .{
             .allocator = allocator,
@@ -208,27 +210,6 @@ pub const QdrantVectorStore = struct {
         return alloc.dupe(u8, buf.items);
     }
 
-    fn appendJsonEscaped(buf: *std.ArrayListUnmanaged(u8), alloc: Allocator, text: []const u8) !void {
-        for (text) |ch| {
-            switch (ch) {
-                '"' => try buf.appendSlice(alloc, "\\\""),
-                '\\' => try buf.appendSlice(alloc, "\\\\"),
-                '\n' => try buf.appendSlice(alloc, "\\n"),
-                '\r' => try buf.appendSlice(alloc, "\\r"),
-                '\t' => try buf.appendSlice(alloc, "\\t"),
-                else => {
-                    if (ch < 0x20) {
-                        var hex_buf: [6]u8 = undefined;
-                        const hex = std.fmt.bufPrint(&hex_buf, "\\u{x:0>4}", .{ch}) catch continue;
-                        try buf.appendSlice(alloc, hex);
-                    } else {
-                        try buf.append(alloc, ch);
-                    }
-                },
-            }
-        }
-    }
-
     // ── Response parsers ──────────────────────────────────────────
 
     fn parseSearchResults(alloc: Allocator, body: []const u8) ![]VectorResult {
@@ -279,8 +260,10 @@ pub const QdrantVectorStore = struct {
                 else => continue,
             };
 
+            const owned_key = try alloc.dupe(u8, key_str);
+            errdefer alloc.free(owned_key);
             try results.append(alloc, .{
-                .key = try alloc.dupe(u8, key_str),
+                .key = owned_key,
                 .score = score,
             });
         }
@@ -678,7 +661,7 @@ test "appendJsonEscaped handles special characters" {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(alloc);
 
-    try QdrantVectorStore.appendJsonEscaped(&buf, alloc, "hello \"world\"\nnewline\\slash");
+    try appendJsonEscaped(&buf, alloc, "hello \"world\"\nnewline\\slash");
 
     try std.testing.expectEqualStrings("hello \\\"world\\\"\\nnewline\\\\slash", buf.items);
 }
@@ -688,7 +671,7 @@ test "appendJsonEscaped handles plain text" {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(alloc);
 
-    try QdrantVectorStore.appendJsonEscaped(&buf, alloc, "simple text");
+    try appendJsonEscaped(&buf, alloc, "simple text");
 
     try std.testing.expectEqualStrings("simple text", buf.items);
 }

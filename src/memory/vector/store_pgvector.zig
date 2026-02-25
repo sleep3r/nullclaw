@@ -252,8 +252,10 @@ pub const PgvectorVectorStore = struct {
             const sim_slice: []const u8 = std.mem.span(sim_raw);
 
             const score = std.fmt.parseFloat(f32, sim_slice) catch 0.0;
+            const owned_key = try alloc.dupe(u8, key_slice);
+            errdefer alloc.free(owned_key);
             try results.append(alloc, .{
-                .key = try alloc.dupe(u8, key_slice),
+                .key = owned_key,
                 .score = score,
             });
         }

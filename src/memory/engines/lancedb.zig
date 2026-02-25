@@ -300,7 +300,7 @@ pub const LanceDbMemory = struct {
         }
 
         const Scored = struct { entry: MemoryEntry, score: f32 };
-        var scored: std.ArrayListUnmanaged(Scored) = .{};
+        var scored: std.ArrayListUnmanaged(Scored) = .empty;
         errdefer {
             for (scored.items) |*s| s.entry.deinit(allocator);
             scored.deinit(allocator);
@@ -399,7 +399,7 @@ pub const LanceDbMemory = struct {
             _ = c.sqlite3_bind_text(stmt, 3, sid_z.?.ptr, @intCast(sid_z.?.len), SQLITE_STATIC);
         }
 
-        var results: std.ArrayListUnmanaged(MemoryEntry) = .{};
+        var results: std.ArrayListUnmanaged(MemoryEntry) = .empty;
         errdefer {
             for (results.items) |*e| e.deinit(allocator);
             results.deinit(allocator);
@@ -486,7 +486,7 @@ pub const LanceDbMemory = struct {
         const self_: *Self = @ptrCast(@alignCast(ptr));
         const db = self_.db orelse return error.NotConnected;
 
-        var results: std.ArrayListUnmanaged(MemoryEntry) = .{};
+        var results: std.ArrayListUnmanaged(MemoryEntry) = .empty;
         errdefer {
             for (results.items) |*e| e.deinit(allocator);
             results.deinit(allocator);

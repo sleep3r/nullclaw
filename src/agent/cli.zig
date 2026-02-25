@@ -128,6 +128,11 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     // Bind memory backend once for this tool set before creating agents.
     tools_mod.bindMemoryTools(tools, mem_opt);
 
+    // Bind MemoryRuntime to memory tools for hybrid search and vector sync.
+    if (mem_rt) |*rt| {
+        tools_mod.bindMemoryRuntime(tools, rt);
+    }
+
     // Provider interface from runtime bundle (includes retries/fallbacks).
     const provider_i: Provider = runtime_provider.provider();
 
@@ -145,6 +150,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         agent.policy = &policy;
         agent.session_store = if (mem_rt) |rt| rt.session_store else null;
         agent.response_cache = if (mem_rt) |*rt| rt.response_cache else null;
+        agent.mem_rt = if (mem_rt) |*rt| rt else null;
         if (session_id) |sid| {
             agent.memory_session_id = sid;
         }
@@ -228,6 +234,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     agent.policy = &policy;
     agent.session_store = if (mem_rt) |rt| rt.session_store else null;
     agent.response_cache = if (mem_rt) |*rt| rt.response_cache else null;
+    agent.mem_rt = if (mem_rt) |*rt| rt else null;
     if (session_id) |sid| {
         agent.memory_session_id = sid;
     }

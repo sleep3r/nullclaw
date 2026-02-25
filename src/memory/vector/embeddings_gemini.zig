@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const EmbeddingProvider = @import("embeddings.zig").EmbeddingProvider;
+const appendJsonEscaped = @import("../../util.zig").appendJsonEscaped;
 
 pub const GeminiEmbedding = struct {
     allocator: std.mem.Allocator,
@@ -148,8 +149,11 @@ pub fn parseGeminiResponse(allocator: std.mem.Allocator, json_bytes: []const u8)
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{}) catch return error.InvalidEmbeddingResponse;
     defer parsed.deinit();
 
-    const root = parsed.value;
-    const embedding_obj = root.object.get("embedding") orelse return error.InvalidEmbeddingResponse;
+    const root = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidEmbeddingResponse,
+    };
+    const embedding_obj = root.get("embedding") orelse return error.InvalidEmbeddingResponse;
     const values = switch (embedding_obj) {
         .object => |obj| obj.get("values") orelse return error.InvalidEmbeddingResponse,
         else => return error.InvalidEmbeddingResponse,
@@ -168,27 +172,6 @@ pub fn parseGeminiResponse(allocator: std.mem.Allocator, json_bytes: []const u8)
         };
     }
     return result;
-}
-
-fn appendJsonEscaped(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, text: []const u8) !void {
-    for (text) |ch| {
-        switch (ch) {
-            '"' => try buf.appendSlice(allocator, "\\\""),
-            '\\' => try buf.appendSlice(allocator, "\\\\"),
-            '\n' => try buf.appendSlice(allocator, "\\n"),
-            '\r' => try buf.appendSlice(allocator, "\\r"),
-            '\t' => try buf.appendSlice(allocator, "\\t"),
-            else => {
-                if (ch < 0x20) {
-                    var hex_buf: [6]u8 = undefined;
-                    const hex = std.fmt.bufPrint(&hex_buf, "\\u{x:0>4}", .{ch}) catch continue;
-                    try buf.appendSlice(allocator, hex);
-                } else {
-                    try buf.append(allocator, ch);
-                }
-            },
-        }
-    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────

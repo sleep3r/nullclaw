@@ -48,7 +48,7 @@ pub fn build(b: *std.Build) void {
     // Link SQLite on the compile step (not the module)
     exe.linkLibrary(sqlite3);
     if (enable_postgres) {
-        exe.linkSystemLibrary("pq");
+        exe.root_module.linkSystemLibrary("pq", .{});
     }
     exe.dead_strip_dylibs = true;
 
@@ -82,7 +82,7 @@ pub fn build(b: *std.Build) void {
     const lib_tests = b.addTest(.{ .root_module = lib_mod });
     lib_tests.linkLibrary(sqlite3);
     if (enable_postgres) {
-        lib_tests.linkSystemLibrary("pq");
+        lib_tests.root_module.linkSystemLibrary("pq", .{});
     }
 
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });

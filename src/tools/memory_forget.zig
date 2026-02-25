@@ -30,6 +30,7 @@ pub const MemoryForgetTool = struct {
     pub fn execute(self: *MemoryForgetTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const key = root.getString(args, "key") orelse
             return ToolResult.fail("Missing 'key' parameter");
+        if (key.len == 0) return ToolResult.fail("'key' must not be empty");
 
         const m = self.memory orelse {
             const msg = try std.fmt.allocPrint(allocator, "Memory backend not configured. Cannot forget: {s}", .{key});
