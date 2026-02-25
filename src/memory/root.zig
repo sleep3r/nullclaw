@@ -653,20 +653,23 @@ pub fn initRuntime(
         const eng = allocator.create(retrieval.RetrievalEngine) catch break :build_engine;
         eng.* = retrieval.RetrievalEngine.init(allocator, config.search.query);
 
-        // Always add primary adapter
-        const primary = allocator.create(retrieval.PrimaryAdapter) catch {
-            allocator.destroy(eng);
-            break :build_engine;
-        };
-        primary.* = retrieval.PrimaryAdapter.init(instance.memory);
-        primary.owns_self = true;
-        primary.allocator = allocator;
-        eng.addSource(primary.adapter()) catch {
-            allocator.destroy(primary);
-            eng.deinit();
-            allocator.destroy(eng);
-            break :build_engine;
-        };
+        // Add primary adapter unless QMD-only mode is explicitly requested.
+        const include_primary = !config.qmd.enabled or config.qmd.include_default_memory;
+        if (include_primary) {
+            const primary = allocator.create(retrieval.PrimaryAdapter) catch {
+                allocator.destroy(eng);
+                break :build_engine;
+            };
+            primary.* = retrieval.PrimaryAdapter.init(instance.memory);
+            primary.owns_self = true;
+            primary.allocator = allocator;
+            eng.addSource(primary.adapter()) catch {
+                allocator.destroy(primary);
+                eng.deinit();
+                allocator.destroy(eng);
+                break :build_engine;
+            };
+        }
 
         // QMD adapter (optional — alloc failure just skips it, engine remains usable)
         if (config.qmd.enabled) {
@@ -1266,6 +1269,39 @@ test "initRuntime engine with qmd disabled has one source" {
     if (rt._engine) |eng| {
         try std.testing.expectEqual(@as(usize, 1), eng.sources.items.len);
     }
+}
+
+test "initRuntime engine with qmd enabled and include_default_memory=true has primary and qmd sources" {
+    var rt = initRuntime(std.testing.allocator, &.{
+        .backend = "none",
+        .qmd = .{
+            .enabled = true,
+            .include_default_memory = true,
+        },
+    }, "/tmp") orelse return error.TestUnexpectedResult;
+    defer rt.deinit();
+
+    if (rt._engine) |eng| {
+        try std.testing.expectEqual(@as(usize, 2), eng.sources.items.len);
+        try std.testing.expectEqualStrings("primary", eng.sources.items[0].getName());
+        try std.testing.expectEqualStrings("qmd", eng.sources.items[1].getName());
+    } else return error.TestUnexpectedResult;
+}
+
+test "initRuntime engine with qmd enabled and include_default_memory=false has qmd-only source" {
+    var rt = initRuntime(std.testing.allocator, &.{
+        .backend = "none",
+        .qmd = .{
+            .enabled = true,
+            .include_default_memory = false,
+        },
+    }, "/tmp") orelse return error.TestUnexpectedResult;
+    defer rt.deinit();
+
+    if (rt._engine) |eng| {
+        try std.testing.expectEqual(@as(usize, 1), eng.sources.items.len);
+        try std.testing.expectEqualStrings("qmd", eng.sources.items[0].getName());
+    } else return error.TestUnexpectedResult;
 }
 
 test "MemoryRuntime.search without engine falls back to recall" {
