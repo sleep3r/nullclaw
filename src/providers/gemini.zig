@@ -7,6 +7,71 @@ const config_types = @import("../config_types.zig");
 const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
 const ChatResponse = root.ChatResponse;
+const OAUTH_REFRESH_TIMEOUT_SECS: u64 = 20;
+
+fn parseExpiresIn(v: std.json.Value) ?i64 {
+    return switch (v) {
+        .integer => |i| if (i > 0) i else null,
+        .float => |f| blk: {
+            if (!std.math.isFinite(f) or f <= 0) break :blk null;
+            if (f > @as(f64, @floatFromInt(std.math.maxInt(i64)))) break :blk null;
+            break :blk @intFromFloat(f);
+        },
+        else => null,
+    };
+}
+
+fn isFormUrlencodedUnreserved(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~';
+}
+
+fn appendFormUrlencodedValue(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    value: []const u8,
+) !void {
+    const HEX = "0123456789ABCDEF";
+    for (value) |c| {
+        if (isFormUrlencodedUnreserved(c)) {
+            try buf.append(allocator, c);
+        } else if (c == ' ') {
+            try buf.append(allocator, '+');
+        } else {
+            try buf.append(allocator, '%');
+            try buf.append(allocator, HEX[(c >> 4) & 0x0F]);
+            try buf.append(allocator, HEX[c & 0x0F]);
+        }
+    }
+}
+
+fn appendFormField(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    value: []const u8,
+) !void {
+    if (buf.items.len > 0) try buf.append(allocator, '&');
+    try appendFormUrlencodedValue(buf, allocator, key);
+    try buf.append(allocator, '=');
+    try appendFormUrlencodedValue(buf, allocator, value);
+}
+
+fn buildRefreshFormBody(
+    allocator: std.mem.Allocator,
+    refresh_token: []const u8,
+    client_id: []const u8,
+    client_secret: []const u8,
+) ![]u8 {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body.deinit(allocator);
+
+    try appendFormField(&body, allocator, "grant_type", "refresh_token");
+    try appendFormField(&body, allocator, "refresh_token", refresh_token);
+    try appendFormField(&body, allocator, "client_id", client_id);
+    try appendFormField(&body, allocator, "client_secret", client_secret);
+
+    return try body.toOwnedSlice(allocator);
+}
 
 /// Credentials loaded from the Gemini CLI OAuth token file (~/.gemini/oauth_creds.json).
 pub const GeminiCliCredentials = struct {
@@ -75,9 +140,113 @@ pub fn parseCredentialsJson(allocator: std.mem.Allocator, json_bytes: []const u8
     };
 }
 
+/// OAuth token refresh response from Google.
+const RefreshResponse = struct {
+    access_token: []const u8,
+    expires_in: i64,
+};
+
+/// Parse OAuth token refresh response from Google's JSON.
+/// Returns null if JSON is invalid or missing required fields.
+/// Returned access_token is duped and owned by caller.
+pub fn parseRefreshResponse(allocator: std.mem.Allocator, json_bytes: []const u8) ?RefreshResponse {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{}) catch return null;
+    defer parsed.deinit();
+
+    const root_obj = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return null,
+    };
+
+    if (root_obj.get("error")) |_| return null;
+
+    const access_token_val = root_obj.get("access_token") orelse return null;
+    const access_token_str = switch (access_token_val) {
+        .string => |s| s,
+        else => return null,
+    };
+    if (access_token_str.len == 0) return null;
+
+    const expires_in_val = root_obj.get("expires_in") orelse return null;
+    const expires_in = parseExpiresIn(expires_in_val) orelse return null;
+
+    // Dupe access_token so it survives parsed.deinit()
+    const access_token = allocator.dupe(u8, access_token_str) catch return null;
+
+    return .{
+        .access_token = access_token,
+        .expires_in = expires_in,
+    };
+}
+
+/// Refresh an OAuth token using Google's OAuth2 endpoint.
+/// Returns the refresh response (access token owned by caller) or error.
+/// Uses builtin.is_test guard to skip actual HTTP calls in tests.
+pub fn refreshOAuthToken(allocator: std.mem.Allocator, refresh_token: []const u8) !RefreshResponse {
+    if (@import("builtin").is_test) {
+        return .{
+            .access_token = try allocator.dupe(u8, "test-refreshed-token"),
+            .expires_in = 3600,
+        };
+    }
+
+    // Public client credentials from the Gemini CLI (not secret)
+    const client_id = "936475272427.apps.googleusercontent.com";
+    const client_secret = "KWaLJfKpIyrGyVOIF2t66XCO";
+
+    const body = try buildRefreshFormBody(allocator, refresh_token, client_id, client_secret);
+    defer allocator.free(body);
+
+    const url = "https://oauth2.googleapis.com/token";
+    const headers = &[_][]const u8{"Content-Type: application/x-www-form-urlencoded"};
+
+    const resp_body = root.curlPostTimed(
+        allocator,
+        url,
+        body,
+        headers,
+        OAUTH_REFRESH_TIMEOUT_SECS,
+    ) catch return error.RefreshFailed;
+    defer allocator.free(resp_body);
+
+    return parseRefreshResponse(allocator, resp_body) orelse return error.RefreshFailed;
+}
+
+/// Write credentials back to ~/.gemini/oauth_creds.json.
+pub fn writeCredentialsJson(allocator: std.mem.Allocator, creds: GeminiCliCredentials, path: []const u8) !void {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "{\"access_token\":");
+    try root.appendJsonString(&buf, allocator, creds.access_token);
+
+    if (creds.refresh_token) |rt| {
+        try buf.appendSlice(allocator, ",\"refresh_token\":");
+        try root.appendJsonString(&buf, allocator, rt);
+    }
+
+    if (creds.expires_at) |exp| {
+        try buf.appendSlice(allocator, ",\"expires_at\":");
+        var num_buf: [24]u8 = undefined;
+        const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{exp}) catch return error.FormatError;
+        try buf.appendSlice(allocator, num_str);
+    }
+
+    try buf.append(allocator, '}');
+
+    const file = std.fs.createFileAbsolute(path, .{ .mode = 0o600 }) catch return error.FileWriteError;
+    defer file.close();
+    try file.writeAll(buf.items);
+}
+
 /// Try to load Gemini CLI OAuth credentials from ~/.gemini/oauth_creds.json.
-/// Returns null on any error (file not found, parse failure, expired token, etc.).
+/// If token is expired but refresh_token is available, attempts to refresh.
+/// Returns null on any error (file not found, parse failure, refresh failed, etc.).
 pub fn tryLoadGeminiCliToken(allocator: std.mem.Allocator) ?GeminiCliCredentials {
+    // Keep tests deterministic and side-effect free: never read or write real
+    // ~/.gemini credentials while running under std.testing.
+    if (@import("builtin").is_test) return null;
+
     const home = platform.getHomeDir(allocator) catch return null;
     defer allocator.free(home);
 
@@ -94,7 +263,37 @@ pub fn tryLoadGeminiCliToken(allocator: std.mem.Allocator) ?GeminiCliCredentials
 
     // Check expiration
     if (creds.isExpired()) {
-        // Clean up allocated strings before returning null
+        // Attempt refresh if refresh_token is available
+        if (creds.refresh_token) |rt| {
+            if (refreshOAuthToken(allocator, rt)) |refreshed_resp| {
+                // Build refreshed credentials
+                const now = std.time.timestamp();
+                const ttl: i64 = if (refreshed_resp.expires_in > 0) refreshed_resp.expires_in else 3600;
+                const new_expires_at = std.math.add(i64, now, ttl) catch std.math.maxInt(i64);
+
+                const refreshed = GeminiCliCredentials{
+                    .access_token = refreshed_resp.access_token,
+                    .refresh_token = allocator.dupe(u8, rt) catch {
+                        allocator.free(refreshed_resp.access_token);
+                        allocator.free(creds.access_token);
+                        if (creds.refresh_token) |r| allocator.free(r);
+                        return null;
+                    },
+                    .expires_at = new_expires_at,
+                };
+
+                // Persist refreshed token (non-fatal on failure)
+                writeCredentialsJson(allocator, refreshed, path) catch {};
+
+                // Clean up original creds
+                allocator.free(creds.access_token);
+                if (creds.refresh_token) |r| allocator.free(r);
+
+                return refreshed;
+            } else |_| {}
+        }
+
+        // Refresh unavailable or failed — clean up and return null
         allocator.free(creds.access_token);
         if (creds.refresh_token) |rt| allocator.free(rt);
         return null;
@@ -111,13 +310,15 @@ pub const GeminiAuth = union(enum) {
     env_gemini_key: []const u8,
     /// API key from `GOOGLE_API_KEY` env var.
     env_google_key: []const u8,
+    /// OAuth access token from `GEMINI_OAUTH_TOKEN` env var.
+    env_oauth_token: []const u8,
     /// OAuth access token from Gemini CLI: sent as `Authorization: Bearer`.
     oauth_token: []const u8,
 
     pub fn isApiKey(self: GeminiAuth) bool {
         return switch (self) {
             .explicit_key, .env_gemini_key, .env_google_key => true,
-            .oauth_token => false,
+            .env_oauth_token, .oauth_token => false,
         };
     }
 
@@ -126,6 +327,7 @@ pub const GeminiAuth = union(enum) {
             .explicit_key => |v| v,
             .env_gemini_key => |v| v,
             .env_google_key => |v| v,
+            .env_oauth_token => |v| v,
             .oauth_token => |v| v,
         };
     }
@@ -135,6 +337,7 @@ pub const GeminiAuth = union(enum) {
             .explicit_key => "config",
             .env_gemini_key => "GEMINI_API_KEY env var",
             .env_google_key => "GOOGLE_API_KEY env var",
+            .env_oauth_token => "GEMINI_OAUTH_TOKEN env var",
             .oauth_token => "Gemini CLI OAuth",
         };
     }
@@ -177,6 +380,14 @@ pub const GeminiProvider = struct {
             }
         }
 
+        // 2b. GEMINI_OAUTH_TOKEN env var (explicit OAuth token)
+        if (auth == null) {
+            if (loadNonEmptyEnv(allocator, "GEMINI_OAUTH_TOKEN")) |value| {
+                auth = .{ .env_oauth_token = value };
+                // Note: value is NOT freed — ownership transfers to auth
+            }
+        }
+
         // 3. Gemini CLI OAuth token (~/.gemini/oauth_creds.json) as final fallback
         if (auth == null) {
             if (tryLoadGeminiCliToken(allocator)) |creds| {
@@ -196,11 +407,11 @@ pub const GeminiProvider = struct {
 
     fn loadNonEmptyEnv(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
         if (std.process.getEnvVarOwned(allocator, name)) |value| {
+            defer allocator.free(value);
             const trimmed = std.mem.trim(u8, value, " \t\r\n");
             if (trimmed.len > 0) {
-                return value;
+                return allocator.dupe(u8, trimmed) catch null;
             }
-            allocator.free(value);
             return null;
         } else |_| {
             return null;
@@ -636,7 +847,17 @@ pub const GeminiProvider = struct {
         return "Gemini";
     }
 
-    fn deinitImpl(_: *anyopaque) void {}
+    fn deinitImpl(ptr: *anyopaque) void {
+        const self: *GeminiProvider = @ptrCast(@alignCast(ptr));
+        if (self.auth) |auth| {
+            switch (auth) {
+                .env_oauth_token => |tok| self.allocator.free(tok),
+                .oauth_token => |tok| self.allocator.free(tok),
+                else => {},
+            }
+        }
+        self.auth = null;
+    }
 
     fn supportsStreamingImpl(_: *anyopaque) bool {
         return true;
@@ -770,6 +991,7 @@ fn buildChatRequestBody(
 test "provider creates without key" {
     const p = GeminiProvider.init(std.testing.allocator, null);
     defer if (p.auth) |a| switch (a) {
+        .env_oauth_token => |tok| std.testing.allocator.free(tok),
         .oauth_token => |tok| std.testing.allocator.free(tok),
         else => {},
     };
@@ -785,6 +1007,7 @@ test "provider creates with key" {
 test "provider rejects empty key" {
     const p = GeminiProvider.init(std.testing.allocator, "");
     defer if (p.auth) |a| switch (a) {
+        .env_oauth_token => |tok| std.testing.allocator.free(tok),
         .oauth_token => |tok| std.testing.allocator.free(tok),
         else => {},
     };
@@ -911,6 +1134,7 @@ test "parseResponse multiple parts returns first text" {
 test "provider rejects whitespace key" {
     const p = GeminiProvider.init(std.testing.allocator, "   ");
     defer if (p.auth) |a| switch (a) {
+        .env_oauth_token => |tok| std.testing.allocator.free(tok),
         .oauth_token => |tok| std.testing.allocator.free(tok),
         else => {},
     };
@@ -1055,17 +1279,11 @@ test "GeminiCliCredentials isExpired with 5-min buffer edge case" {
     try std.testing.expect(!creds_valid.isExpired());
 }
 
-test "tryLoadGeminiCliToken returns null for nonexistent path" {
-    // Unless the user has ~/.gemini/oauth_creds.json, this returns null.
-    // In CI / test environments it should always be null.
-    // We can't control HOME here, but the function should not crash.
+test "tryLoadGeminiCliToken is side-effect free in test mode" {
+    // In test mode we always return null to avoid touching real ~/.gemini
+    // credentials on developer machines.
     const result = tryLoadGeminiCliToken(std.testing.allocator);
-    if (result) |creds| {
-        // If credentials were found (developer machine), they should be valid
-        std.testing.allocator.free(creds.access_token);
-        if (creds.refresh_token) |rt| std.testing.allocator.free(rt);
-    }
-    // Either way, the function should not crash — this test validates robustness.
+    try std.testing.expect(result == null);
 }
 
 test "parseCredentialsJson valid JSON with all fields" {
@@ -1206,4 +1424,227 @@ test "gemini buildChatRequestBody with image_url special chars" {
     try std.testing.expectEqual(@as(usize, 1), parts.items.len);
     const text = parts.items[0].object.get("text").?.string;
     try std.testing.expect(std.mem.indexOf(u8, text, "\"quote\"") != null);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// OAuth Refresh Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "parseRefreshResponse extracts access token" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"access_token":"new-token-abc","expires_in":3600,"token_type":"Bearer"}
+    ;
+    const result = parseRefreshResponse(alloc, json) orelse return error.TestUnexpectedResult;
+    defer alloc.free(result.access_token);
+    try std.testing.expectEqualStrings("new-token-abc", result.access_token);
+    try std.testing.expect(result.expires_in == 3600);
+}
+
+test "parseRefreshResponse handles error response" {
+    const json =
+        \\{"error":"invalid_grant","error_description":"Bad Request"}
+    ;
+    const result = parseRefreshResponse(std.testing.allocator, json);
+    try std.testing.expect(result == null);
+}
+
+test "parseRefreshResponse handles empty access token" {
+    const json =
+        \\{"access_token":"","expires_in":3600}
+    ;
+    const result = parseRefreshResponse(std.testing.allocator, json);
+    try std.testing.expect(result == null);
+}
+
+test "parseRefreshResponse handles missing fields" {
+    const json =
+        \\{"access_token":"token-123"}
+    ;
+    const result = parseRefreshResponse(std.testing.allocator, json);
+    try std.testing.expect(result == null);
+}
+
+test "parseRefreshResponse rejects invalid expires_in float" {
+    const json =
+        \\{"access_token":"new-token-abc","expires_in":"not-a-number"}
+    ;
+    const result = parseRefreshResponse(std.testing.allocator, json);
+    try std.testing.expect(result == null);
+}
+
+test "parseRefreshResponse rejects non-positive expires_in" {
+    const json_zero =
+        \\{"access_token":"new-token-abc","expires_in":0}
+    ;
+    const json_neg =
+        \\{"access_token":"new-token-abc","expires_in":-5}
+    ;
+    try std.testing.expect(parseRefreshResponse(std.testing.allocator, json_zero) == null);
+    try std.testing.expect(parseRefreshResponse(std.testing.allocator, json_neg) == null);
+}
+
+test "refreshOAuthToken returns test token in test mode" {
+    const alloc = std.testing.allocator;
+    const resp = try refreshOAuthToken(alloc, "test-refresh-token");
+    defer alloc.free(resp.access_token);
+    try std.testing.expectEqualStrings("test-refreshed-token", resp.access_token);
+    try std.testing.expectEqual(@as(i64, 3600), resp.expires_in);
+}
+
+test "buildRefreshFormBody percent-encodes reserved chars" {
+    const alloc = std.testing.allocator;
+    const body = try buildRefreshFormBody(
+        alloc,
+        "a+b/c= d?e&f",
+        "client:abc/123",
+        "sec+ret&x=y",
+    );
+    defer alloc.free(body);
+
+    try std.testing.expectEqualStrings(
+        "grant_type=refresh_token&refresh_token=a%2Bb%2Fc%3D+d%3Fe%26f&client_id=client%3Aabc%2F123&client_secret=sec%2Bret%26x%3Dy",
+        body,
+    );
+}
+
+test "GeminiAuth env_oauth_token is not api key" {
+    const auth = GeminiAuth{ .env_oauth_token = "ya29.test" };
+    try std.testing.expect(!auth.isApiKey());
+    try std.testing.expectEqualStrings("ya29.test", auth.credential());
+    try std.testing.expectEqualStrings("GEMINI_OAUTH_TOKEN env var", auth.source());
+}
+
+test "provider deinit frees env_oauth_token" {
+    const alloc = std.testing.allocator;
+    var p = GeminiProvider{
+        .auth = .{ .env_oauth_token = try alloc.dupe(u8, "ya29.token") },
+        .allocator = alloc,
+    };
+    const prov = p.provider();
+    prov.deinit();
+    try std.testing.expect(p.auth == null);
+}
+
+test "provider deinit frees oauth_token" {
+    const alloc = std.testing.allocator;
+    var p = GeminiProvider{
+        .auth = .{ .oauth_token = try alloc.dupe(u8, "ya29.token") },
+        .allocator = alloc,
+    };
+    const prov = p.provider();
+    prov.deinit();
+    try std.testing.expect(p.auth == null);
+}
+
+test "writeCredentialsJson produces valid JSON" {
+    const alloc = std.testing.allocator;
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+
+    // Create placeholder file so realpathAlloc works
+    const tmp_file = try temp_dir.dir.createFile("creds.json", .{});
+    tmp_file.close();
+
+    const path = try temp_dir.dir.realpathAlloc(alloc, "creds.json");
+    defer alloc.free(path);
+
+    const creds = GeminiCliCredentials{
+        .access_token = "test-access-token",
+        .refresh_token = "test-refresh-token",
+        .expires_at = 1999999999,
+    };
+
+    try writeCredentialsJson(alloc, creds, path);
+
+    // Read back and verify valid JSON
+    const file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+
+    const content = try file.readToEndAlloc(alloc, 4096);
+    defer alloc.free(content);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, content, .{});
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("test-access-token", obj.get("access_token").?.string);
+    try std.testing.expectEqualStrings("test-refresh-token", obj.get("refresh_token").?.string);
+    try std.testing.expect(obj.get("expires_at").?.integer == 1999999999);
+
+    if (@import("builtin").os.tag != .windows and @import("builtin").os.tag != .wasi) {
+        const stat = try file.stat();
+        const mode = stat.mode & 0o777;
+        // Respect process umask: require owner rw and forbid executable bits.
+        try std.testing.expect((mode & 0o600) == 0o600);
+        try std.testing.expect((mode & 0o111) == 0);
+    }
+}
+
+test "writeCredentialsJson without refresh token" {
+    const alloc = std.testing.allocator;
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+
+    const tmp_file = try temp_dir.dir.createFile("creds2.json", .{});
+    tmp_file.close();
+
+    const path = try temp_dir.dir.realpathAlloc(alloc, "creds2.json");
+    defer alloc.free(path);
+
+    const creds = GeminiCliCredentials{
+        .access_token = "token-only",
+        .refresh_token = null,
+        .expires_at = null,
+    };
+
+    try writeCredentialsJson(alloc, creds, path);
+
+    const file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+
+    const content = try file.readToEndAlloc(alloc, 4096);
+    defer alloc.free(content);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, content, .{});
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("token-only", obj.get("access_token").?.string);
+    try std.testing.expect(obj.get("refresh_token") == null);
+    try std.testing.expect(obj.get("expires_at") == null);
+}
+
+test "writeCredentialsJson escapes token strings" {
+    const alloc = std.testing.allocator;
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+
+    const tmp_file = try temp_dir.dir.createFile("creds-escaped.json", .{});
+    tmp_file.close();
+
+    const path = try temp_dir.dir.realpathAlloc(alloc, "creds-escaped.json");
+    defer alloc.free(path);
+
+    const access_token = "tok\"en\\line\nbreak";
+    const refresh_token = "ref\twith\rcontrol";
+    const creds = GeminiCliCredentials{
+        .access_token = access_token,
+        .refresh_token = refresh_token,
+        .expires_at = null,
+    };
+
+    try writeCredentialsJson(alloc, creds, path);
+
+    const file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(alloc, 4096);
+    defer alloc.free(content);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, content, .{});
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings(access_token, obj.get("access_token").?.string);
+    try std.testing.expectEqualStrings(refresh_token, obj.get("refresh_token").?.string);
 }
