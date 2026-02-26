@@ -3,6 +3,7 @@ const std = @import("std");
 pub const ApiErrorKind = enum {
     rate_limited,
     context_exhausted,
+    vision_unsupported,
     other,
 };
 
@@ -10,6 +11,7 @@ pub fn kindToError(kind: ApiErrorKind) anyerror {
     return switch (kind) {
         .rate_limited => error.RateLimited,
         .context_exhausted => error.ContextLengthExceeded,
+        .vision_unsupported => error.ProviderDoesNotSupportVision,
         .other => error.ApiError,
     };
 }
@@ -86,6 +88,22 @@ pub fn isContextExhaustedText(text: []const u8) bool {
     return containsAsciiFold(text, "413") and containsAsciiFold(text, "too large");
 }
 
+pub fn isVisionUnsupportedText(text: []const u8) bool {
+    if (text.len == 0) return false;
+
+    if (containsAsciiFold(text, "does not support image") or
+        containsAsciiFold(text, "doesn't support image") or
+        containsAsciiFold(text, "image input not supported") or
+        containsAsciiFold(text, "no endpoints found that support image input") or
+        containsAsciiFold(text, "vision not supported") or
+        containsAsciiFold(text, "multimodal not supported"))
+    {
+        return true;
+    }
+
+    return false;
+}
+
 fn parseStatusCode(value: std.json.Value) ?u16 {
     return switch (value) {
         .integer => |i| blk: {
@@ -111,14 +129,17 @@ fn classifyFromFields(
     if (message) |msg| {
         if (isRateLimitedText(msg)) return .rate_limited;
         if (isContextExhaustedText(msg)) return .context_exhausted;
+        if (isVisionUnsupportedText(msg)) return .vision_unsupported;
     }
     if (type_name) |typ| {
         if (isRateLimitedText(typ)) return .rate_limited;
         if (isContextExhaustedText(typ)) return .context_exhausted;
+        if (isVisionUnsupportedText(typ)) return .vision_unsupported;
     }
     if (code) |raw_code| {
         if (isRateLimitedText(raw_code)) return .rate_limited;
         if (isContextExhaustedText(raw_code)) return .context_exhausted;
+        if (isVisionUnsupportedText(raw_code)) return .vision_unsupported;
     }
 
     return .other;
@@ -232,6 +253,15 @@ test "classifyKnownApiError detects context payloads" {
     defer parsed.deinit();
 
     try std.testing.expectEqual(.context_exhausted, classifyKnownApiError(parsed.value.object).?);
+}
+
+test "classifyKnownApiError detects vision unsupported payloads" {
+    const body = "{\"error\":{\"message\":\"No endpoints found that support image input\",\"code\":404}}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(.vision_unsupported, classifyKnownApiError(parsed.value.object).?);
+    try std.testing.expect(kindToError(.vision_unsupported) == error.ProviderDoesNotSupportVision);
 }
 
 test "classifyKnownApiError returns null for non-error payload" {

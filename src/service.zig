@@ -1,13 +1,15 @@
-//! Service management — launchd (macOS) and systemd (Linux) user services.
+//! Service management — launchd (macOS), systemd (Linux), and SCM (Windows).
 //!
 //! Mirrors ZeroClaw's service module: install, start, stop, status, uninstall.
-//! Uses child process execution to interact with launchctl / systemctl.
+//! Uses child process execution to interact with launchctl / systemctl / sc.exe.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("platform.zig");
 
 const SERVICE_LABEL = "com.nullclaw.daemon";
+const WINDOWS_SERVICE_NAME = "nullclaw";
+const WINDOWS_SERVICE_DISPLAY_NAME = "nullclaw gateway runtime";
 
 pub const ServiceCommand = enum {
     install,
@@ -46,6 +48,8 @@ fn install(allocator: std.mem.Allocator, config_path: []const u8) !void {
         try installMacos(allocator, config_path);
     } else if (comptime builtin.os.tag == .linux) {
         try installLinux(allocator);
+    } else if (comptime builtin.os.tag == .windows) {
+        try installWindows(allocator);
     } else {
         return error.UnsupportedPlatform;
     }
@@ -61,6 +65,8 @@ fn startService(allocator: std.mem.Allocator) !void {
         try assertLinuxSystemdUserAvailable(allocator);
         try runChecked(allocator, &.{ "systemctl", "--user", "daemon-reload" });
         try runChecked(allocator, &.{ "systemctl", "--user", "start", "nullclaw.service" });
+    } else if (comptime builtin.os.tag == .windows) {
+        try runChecked(allocator, &.{ "sc.exe", "start", WINDOWS_SERVICE_NAME });
     } else {
         return error.UnsupportedPlatform;
     }
@@ -75,6 +81,8 @@ fn stopService(allocator: std.mem.Allocator) !void {
     } else if (comptime builtin.os.tag == .linux) {
         try assertLinuxSystemdUserAvailable(allocator);
         try runChecked(allocator, &.{ "systemctl", "--user", "stop", "nullclaw.service" });
+    } else if (comptime builtin.os.tag == .windows) {
+        try runChecked(allocator, &.{ "sc.exe", "stop", WINDOWS_SERVICE_NAME });
     } else {
         return error.UnsupportedPlatform;
     }
@@ -103,19 +111,36 @@ fn serviceStatus(allocator: std.mem.Allocator) !void {
         defer allocator.free(unit);
         try w.print("Unit: {s}\n", .{unit});
         try w.flush();
+    } else if (comptime builtin.os.tag == .windows) {
+        const status = try runCaptureStatus(allocator, &.{ "sc.exe", "query", WINDOWS_SERVICE_NAME });
+        defer allocator.free(status.stdout);
+        defer allocator.free(status.stderr);
+
+        const detail = captureStatusDetail(&status);
+        if (!status.success and isWindowsServiceMissingDetail(detail)) {
+            try w.print("Service: not installed\n", .{});
+            try w.print("Name: {s}\n", .{WINDOWS_SERVICE_NAME});
+            try w.flush();
+            return;
+        }
+        if (!status.success) return error.CommandFailed;
+
+        try w.print("Service state: {s}\n", .{windowsServiceState(status.stdout)});
+        try w.print("Name: {s}\n", .{WINDOWS_SERVICE_NAME});
+        try w.flush();
     } else {
         return error.UnsupportedPlatform;
     }
 }
 
 fn uninstall(allocator: std.mem.Allocator) !void {
-    try stopService(allocator);
-
     if (comptime builtin.os.tag == .macos) {
+        try stopService(allocator);
         const plist = try macosServiceFile(allocator);
         defer allocator.free(plist);
         std.fs.deleteFileAbsolute(plist) catch {};
     } else if (comptime builtin.os.tag == .linux) {
+        try stopService(allocator);
         const unit = try linuxServiceFile(allocator);
         defer allocator.free(unit);
         std.fs.deleteFileAbsolute(unit) catch |err| switch (err) {
@@ -124,6 +149,8 @@ fn uninstall(allocator: std.mem.Allocator) !void {
         };
         try assertLinuxSystemdUserAvailable(allocator);
         try runChecked(allocator, &.{ "systemctl", "--user", "daemon-reload" });
+    } else if (comptime builtin.os.tag == .windows) {
+        try uninstallWindows(allocator);
     } else {
         return error.UnsupportedPlatform;
     }
@@ -169,7 +196,7 @@ fn installMacos(allocator: std.mem.Allocator, _: []const u8) !void {
         \\  <key>ProgramArguments</key>
         \\  <array>
         \\    <string>{s}</string>
-        \\    <string>daemon</string>
+        \\    <string>gateway</string>
         \\  </array>
         \\  <key>RunAtLoad</key>
         \\  <true/>
@@ -204,12 +231,12 @@ fn installLinux(allocator: std.mem.Allocator) !void {
 
     const content = try std.fmt.allocPrint(allocator,
         \\[Unit]
-        \\Description=nullclaw daemon
+        \\Description=nullclaw gateway runtime
         \\After=network.target
         \\
         \\[Service]
         \\Type=simple
-        \\ExecStart={s} daemon
+        \\ExecStart={s} gateway
         \\Restart=always
         \\RestartSec=3
         \\
@@ -224,6 +251,64 @@ fn installLinux(allocator: std.mem.Allocator) !void {
 
     try runChecked(allocator, &.{ "systemctl", "--user", "daemon-reload" });
     try runChecked(allocator, &.{ "systemctl", "--user", "enable", "nullclaw.service" });
+}
+
+fn installWindows(allocator: std.mem.Allocator) !void {
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_path = try std.fs.selfExePath(&exe_buf);
+    const bin_path = try std.fmt.allocPrint(allocator, "\"{s}\" gateway", .{exe_path});
+    defer allocator.free(bin_path);
+
+    const create = try runCaptureStatus(allocator, &.{
+        "sc.exe",
+        "create",
+        WINDOWS_SERVICE_NAME,
+        "binPath=",
+        bin_path,
+        "start=",
+        "auto",
+        "DisplayName=",
+        WINDOWS_SERVICE_DISPLAY_NAME,
+    });
+    defer allocator.free(create.stdout);
+    defer allocator.free(create.stderr);
+
+    if (!create.success) {
+        const detail = captureStatusDetail(&create);
+        if (!isWindowsServiceAlreadyExistsDetail(detail)) return error.CommandFailed;
+        try runChecked(allocator, &.{
+            "sc.exe",
+            "config",
+            WINDOWS_SERVICE_NAME,
+            "binPath=",
+            bin_path,
+            "start=",
+            "auto",
+            "DisplayName=",
+            WINDOWS_SERVICE_DISPLAY_NAME,
+        });
+    }
+
+    // Best-effort metadata polish.
+    runChecked(allocator, &.{ "sc.exe", "description", WINDOWS_SERVICE_NAME, WINDOWS_SERVICE_DISPLAY_NAME }) catch {};
+}
+
+fn uninstallWindows(allocator: std.mem.Allocator) !void {
+    // Stop is best-effort.
+    const stop = try runCaptureStatus(allocator, &.{ "sc.exe", "stop", WINDOWS_SERVICE_NAME });
+    defer allocator.free(stop.stdout);
+    defer allocator.free(stop.stderr);
+    if (!stop.success and !isWindowsServiceMissingDetail(captureStatusDetail(&stop))) {
+        // Ignore stop races/non-running state.
+    }
+
+    const del = try runCaptureStatus(allocator, &.{ "sc.exe", "delete", WINDOWS_SERVICE_NAME });
+    defer allocator.free(del.stdout);
+    defer allocator.free(del.stderr);
+
+    if (!del.success and !isWindowsServiceMissingDetail(captureStatusDetail(&del))) {
+        return error.CommandFailed;
+    }
 }
 
 // ── Path helpers ─────────────────────────────────────────────────
@@ -252,6 +337,12 @@ const CaptureStatus = struct {
     success: bool,
 };
 
+fn captureStatusDetail(status: *const CaptureStatus) []const u8 {
+    const stderr_trimmed = std.mem.trim(u8, status.stderr, " \t\r\n");
+    if (stderr_trimmed.len > 0) return stderr_trimmed;
+    return std.mem.trim(u8, status.stdout, " \t\r\n");
+}
+
 fn isSystemdUnavailableDetail(detail: []const u8) bool {
     return std.ascii.indexOfIgnoreCase(detail, "systemctl --user unavailable") != null or
         std.ascii.indexOfIgnoreCase(detail, "systemctl not available") != null or
@@ -260,6 +351,26 @@ fn isSystemdUnavailableDetail(detail: []const u8) bool {
         std.ascii.indexOfIgnoreCase(detail, "system has not been booted with systemd") != null or
         std.ascii.indexOfIgnoreCase(detail, "systemd user services are required") != null or
         std.ascii.indexOfIgnoreCase(detail, "no such file or directory") != null;
+}
+
+fn isWindowsServiceMissingDetail(detail: []const u8) bool {
+    return std.ascii.indexOfIgnoreCase(detail, "1060") != null or
+        std.ascii.indexOfIgnoreCase(detail, "does not exist as an installed service") != null or
+        std.ascii.indexOfIgnoreCase(detail, "service does not exist") != null;
+}
+
+fn isWindowsServiceAlreadyExistsDetail(detail: []const u8) bool {
+    return std.ascii.indexOfIgnoreCase(detail, "1073") != null or
+        std.ascii.indexOfIgnoreCase(detail, "already exists") != null;
+}
+
+fn windowsServiceState(query_output: []const u8) []const u8 {
+    if (std.ascii.indexOfIgnoreCase(query_output, "RUNNING") != null) return "running";
+    if (std.ascii.indexOfIgnoreCase(query_output, "STOPPED") != null) return "stopped";
+    if (std.ascii.indexOfIgnoreCase(query_output, "START_PENDING") != null) return "start_pending";
+    if (std.ascii.indexOfIgnoreCase(query_output, "STOP_PENDING") != null) return "stop_pending";
+    if (std.ascii.indexOfIgnoreCase(query_output, "PAUSED") != null) return "paused";
+    return "unknown";
 }
 
 fn runCaptureStatus(allocator: std.mem.Allocator, argv: []const []const u8) !CaptureStatus {
@@ -317,7 +428,9 @@ fn assertLinuxSystemdUserAvailable(allocator: std.mem.Allocator) !void {
 
 fn runChecked(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     var child = std.process.Child.init(argv, allocator);
-    child.stderr_behavior = .Pipe;
+    // Avoid deadlocks: we do not consume pipes in runChecked.
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
     child.spawn() catch |err| switch (err) {
         error.FileNotFound => {
             if (argv.len > 0 and std.mem.eql(u8, argv[0], "systemctl")) return error.SystemctlUnavailable;
@@ -335,7 +448,8 @@ fn runChecked(allocator: std.mem.Allocator, argv: []const []const u8) !void {
 fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
     var child = std.process.Child.init(argv, allocator);
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
+    // We only need stdout here; inheriting/ignoring stderr prevents pipe backpressure hangs.
+    child.stderr_behavior = .Ignore;
     child.spawn() catch |err| switch (err) {
         error.FileNotFound => {
             if (argv.len > 0 and std.mem.eql(u8, argv[0], "systemctl")) return error.SystemctlUnavailable;
@@ -411,4 +525,23 @@ test "isSystemdUnavailableDetail detects common unavailable errors" {
     try std.testing.expect(isSystemdUnavailableDetail("No such file or directory"));
     try std.testing.expect(!isSystemdUnavailableDetail("unit nullclaw.service not found"));
     try std.testing.expect(!isSystemdUnavailableDetail("permission denied"));
+}
+
+test "isWindowsServiceMissingDetail detects missing-service patterns" {
+    try std.testing.expect(isWindowsServiceMissingDetail("OpenService FAILED 1060"));
+    try std.testing.expect(isWindowsServiceMissingDetail("The specified service does not exist as an installed service."));
+    try std.testing.expect(!isWindowsServiceMissingDetail("OpenService FAILED 5: Access is denied."));
+}
+
+test "isWindowsServiceAlreadyExistsDetail detects duplicate-service patterns" {
+    try std.testing.expect(isWindowsServiceAlreadyExistsDetail("CreateService FAILED 1073"));
+    try std.testing.expect(isWindowsServiceAlreadyExistsDetail("service already exists"));
+    try std.testing.expect(!isWindowsServiceAlreadyExistsDetail("CreateService FAILED 5"));
+}
+
+test "windowsServiceState parses common states" {
+    try std.testing.expectEqualStrings("running", windowsServiceState("STATE              : 4  RUNNING"));
+    try std.testing.expectEqualStrings("stopped", windowsServiceState("STATE              : 1  STOPPED"));
+    try std.testing.expectEqualStrings("start_pending", windowsServiceState("STATE              : 2  START_PENDING"));
+    try std.testing.expectEqualStrings("unknown", windowsServiceState("STATE              : ?"));
 }

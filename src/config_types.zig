@@ -1,5 +1,12 @@
 const std = @import("std");
 
+/// Default context token budget used by agent compaction/context management.
+/// Runtime fallback (`DEFAULT_CONTEXT_TOKENS`).
+pub const DEFAULT_AGENT_TOKEN_LIMIT: u64 = 200_000;
+/// Default generation cap when model/provider metadata does not define max output.
+/// Runtime fallback (`DEFAULT_MODEL_MAX_TOKENS`).
+pub const DEFAULT_MODEL_MAX_TOKENS: u32 = 8192;
+
 // ── Autonomy Level ──────────────────────────────────────────────
 
 /// Re-exported from security/policy.zig — single source of truth (with methods).
@@ -109,7 +116,10 @@ pub const AgentConfig = struct {
     max_history_messages: u32 = 50,
     parallel_tools: bool = false,
     tool_dispatcher: []const u8 = "auto",
-    token_limit: u64 = 128_000,
+    token_limit: u64 = DEFAULT_AGENT_TOKEN_LIMIT,
+    /// Internal parse marker: true only when token_limit is explicitly set in config.
+    /// Not serialized; used to distinguish override vs default fallback chain.
+    token_limit_explicit: bool = false,
     session_idle_timeout_secs: u64 = 1800, // evict idle sessions after 30 min
     compaction_keep_recent: u32 = 20,
     compaction_max_summary_chars: u32 = 2_000,
@@ -427,26 +437,273 @@ pub const ChannelsConfig = struct {
 
 // ── Memory config ───────────────────────────────────────────────
 
+/// Memory configuration profile presets.
+pub const MemoryProfile = enum {
+    /// SQLite keyword-only (default).
+    local_keyword,
+    /// File-based markdown memory.
+    markdown_only,
+    /// PostgreSQL keyword-only.
+    postgres_keyword,
+    /// SQLite + vector hybrid.
+    local_hybrid,
+    /// PostgreSQL + vector hybrid.
+    postgres_hybrid,
+    /// Stateless no-op.
+    minimal_none,
+    /// Custom — no profile defaults applied.
+    custom,
+
+    pub fn fromString(s: []const u8) MemoryProfile {
+        if (std.mem.eql(u8, s, "local_keyword")) return .local_keyword;
+        if (std.mem.eql(u8, s, "markdown_only")) return .markdown_only;
+        if (std.mem.eql(u8, s, "postgres_keyword")) return .postgres_keyword;
+        if (std.mem.eql(u8, s, "local_hybrid")) return .local_hybrid;
+        if (std.mem.eql(u8, s, "postgres_hybrid")) return .postgres_hybrid;
+        if (std.mem.eql(u8, s, "minimal_none")) return .minimal_none;
+        return .custom;
+    }
+};
+
 pub const MemoryConfig = struct {
-    backend: []const u8 = "sqlite",
+    pub const DEFAULT_MEMORY_BACKEND: []const u8 = "markdown";
+
+    /// Profile preset — convenience shortcut for common setups.
+    profile: []const u8 = "markdown_only",
+    backend: []const u8 = DEFAULT_MEMORY_BACKEND,
     auto_save: bool = true,
+    citations: []const u8 = "auto",
+    search: MemorySearchConfig = .{},
+    qmd: MemoryQmdConfig = .{},
+    lifecycle: MemoryLifecycleConfig = .{},
+    response_cache: MemoryResponseCacheConfig = .{},
+    reliability: MemoryReliabilityConfig = .{},
+    postgres: MemoryPostgresConfig = .{},
+    redis: MemoryRedisConfig = .{},
+    api: MemoryApiConfig = .{},
+    retrieval_stages: MemoryRetrievalStagesConfig = .{},
+    summarizer: MemorySummarizerConfig = .{},
+
+    /// Apply profile defaults. Only sets fields that are still at their default values,
+    /// so explicit user overrides always win (profile is applied AFTER parsing).
+    pub fn applyProfileDefaults(self: *MemoryConfig) void {
+        const p = MemoryProfile.fromString(self.profile);
+        switch (p) {
+            .local_keyword => {
+                if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "sqlite";
+            },
+            .markdown_only => {
+                // Base default is already markdown.
+            },
+            .postgres_keyword => {
+                if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "postgres";
+            },
+            .local_hybrid => {
+                // SQLite + vector hybrid
+                if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "sqlite";
+                if (std.mem.eql(u8, self.search.provider, "none")) self.search.provider = "openai";
+                if (!self.search.query.hybrid.enabled) self.search.query.hybrid.enabled = true;
+                if (std.mem.eql(u8, self.reliability.rollout_mode, "off")) self.reliability.rollout_mode = "on";
+            },
+            .postgres_hybrid => {
+                if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "postgres";
+                if (std.mem.eql(u8, self.search.provider, "none")) self.search.provider = "openai";
+                if (!self.search.query.hybrid.enabled) self.search.query.hybrid.enabled = true;
+                if (std.mem.eql(u8, self.search.store.kind, "auto")) self.search.store.kind = "pgvector";
+                if (std.mem.eql(u8, self.reliability.rollout_mode, "off")) self.reliability.rollout_mode = "on";
+            },
+            .minimal_none => {
+                if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "none";
+                if (self.auto_save) self.auto_save = false;
+            },
+            .custom => {
+                // No defaults applied — user controls everything.
+            },
+        }
+    }
+};
+
+pub const MemorySearchConfig = struct {
+    enabled: bool = true,
+    provider: []const u8 = "none",
+    model: []const u8 = "text-embedding-3-small",
+    dimensions: u32 = 1536,
+    fallback_provider: []const u8 = "none",
+    store: MemoryVectorStoreConfig = .{},
+    chunking: MemoryChunkingConfig = .{},
+    sync: MemorySyncConfig = .{},
+    query: MemoryQueryConfig = .{},
+    cache: MemoryEmbeddingCacheConfig = .{},
+};
+
+pub const MemoryQmdConfig = struct {
+    enabled: bool = false,
+    command: []const u8 = "qmd",
+    search_mode: []const u8 = "search",
+    include_default_memory: bool = true,
+    mcporter: QmdMcporterConfig = .{},
+    paths: []const QmdIndexPath = &.{},
+    sessions: QmdSessionConfig = .{},
+    update: QmdUpdateConfig = .{},
+    limits: QmdLimitsConfig = .{},
+};
+
+pub const QmdIndexPath = struct {
+    path: []const u8 = "",
+    name: []const u8 = "",
+    pattern: []const u8 = "**/*.md",
+};
+
+pub const QmdMcporterConfig = struct {
+    enabled: bool = false,
+    server_name: []const u8 = "qmd",
+    start_daemon: bool = true,
+};
+
+pub const QmdSessionConfig = struct {
+    enabled: bool = false,
+    export_dir: []const u8 = "",
+    retention_days: u32 = 30,
+};
+
+pub const QmdUpdateConfig = struct {
+    interval_ms: u32 = 300_000,
+    debounce_ms: u32 = 15_000,
+    on_boot: bool = true,
+    wait_for_boot_sync: bool = false,
+    embed_interval_ms: u32 = 3_600_000,
+    command_timeout_ms: u32 = 30_000,
+    update_timeout_ms: u32 = 120_000,
+    embed_timeout_ms: u32 = 120_000,
+};
+
+pub const QmdLimitsConfig = struct {
+    max_results: u32 = 6,
+    max_snippet_chars: u32 = 700,
+    max_injected_chars: u32 = 4_000,
+    timeout_ms: u32 = 4_000,
+};
+
+pub const MemoryVectorStoreConfig = struct {
+    kind: []const u8 = "auto",
+    sidecar_path: []const u8 = "",
+    qdrant_url: []const u8 = "",
+    qdrant_api_key: []const u8 = "",
+    qdrant_collection: []const u8 = "nullclaw_memories",
+    pgvector_table: []const u8 = "memory_embeddings",
+};
+
+pub const MemoryChunkingConfig = struct {
+    max_tokens: u32 = 512,
+    overlap: u32 = 64,
+};
+
+pub const MemorySyncConfig = struct {
+    mode: []const u8 = "best_effort",
+    embed_timeout_ms: u32 = 15_000,
+    vector_timeout_ms: u32 = 5_000,
+    embed_max_retries: u32 = 2,
+    vector_max_retries: u32 = 2,
+};
+
+pub const MemoryQueryConfig = struct {
+    max_results: u32 = 6,
+    min_score: f64 = 0.0,
+    merge_strategy: []const u8 = "rrf",
+    rrf_k: u32 = 60,
+    hybrid: MemoryHybridConfig = .{},
+};
+
+pub const MemoryHybridConfig = struct {
+    enabled: bool = false,
+    vector_weight: f64 = 0.7,
+    text_weight: f64 = 0.3,
+    candidate_multiplier: u32 = 4,
+    mmr: MemoryMmrConfig = .{},
+    temporal_decay: MemoryTemporalDecayConfig = .{},
+};
+
+pub const MemoryMmrConfig = struct {
+    enabled: bool = false,
+    lambda: f64 = 0.7,
+};
+
+pub const MemoryTemporalDecayConfig = struct {
+    enabled: bool = false,
+    half_life_days: u32 = 30,
+};
+
+pub const MemoryEmbeddingCacheConfig = struct {
+    enabled: bool = true,
+    max_entries: u32 = 10_000,
+};
+
+pub const MemoryLifecycleConfig = struct {
     hygiene_enabled: bool = true,
     archive_after_days: u32 = 7,
     purge_after_days: u32 = 30,
     conversation_retention_days: u32 = 30,
-    embedding_provider: []const u8 = "none",
-    embedding_model: []const u8 = "text-embedding-3-small",
-    embedding_dimensions: u32 = 1536,
-    vector_weight: f64 = 0.7,
-    keyword_weight: f64 = 0.3,
-    embedding_cache_size: u32 = 10_000,
-    chunk_max_tokens: u32 = 512,
-    response_cache_enabled: bool = false,
-    response_cache_ttl_minutes: u32 = 60,
-    response_cache_max_entries: u32 = 5_000,
     snapshot_enabled: bool = false,
     snapshot_on_hygiene: bool = false,
     auto_hydrate: bool = true,
+};
+
+pub const MemoryResponseCacheConfig = struct {
+    enabled: bool = false,
+    ttl_minutes: u32 = 60,
+    max_entries: u32 = 5_000,
+};
+
+pub const MemoryReliabilityConfig = struct {
+    rollout_mode: []const u8 = "off",
+    circuit_breaker_failures: u32 = 5,
+    circuit_breaker_cooldown_ms: u32 = 30_000,
+    shadow_hybrid_percent: u32 = 0,
+    canary_hybrid_percent: u32 = 0,
+    /// Fallback policy when optional subsystems (vector plane, cache) fail to init.
+    /// "degrade" (default): silently disable the failed subsystem, log a warning.
+    /// "fail_fast": return null from initRuntime, preventing startup.
+    fallback_policy: []const u8 = "degrade",
+};
+
+pub const MemoryPostgresConfig = struct {
+    url: []const u8 = "",
+    schema: []const u8 = "public",
+    table: []const u8 = "memories",
+    connect_timeout_secs: u32 = 30,
+};
+
+pub const MemoryRedisConfig = struct {
+    host: []const u8 = "127.0.0.1",
+    port: u16 = 6379,
+    password: []const u8 = "",
+    db_index: u8 = 0,
+    key_prefix: []const u8 = "nullclaw",
+    ttl_seconds: u32 = 0, // 0 = no expiry
+};
+
+pub const MemoryApiConfig = struct {
+    url: []const u8 = "",
+    api_key: []const u8 = "",
+    timeout_ms: u32 = 10_000,
+    namespace: []const u8 = "",
+};
+
+pub const MemoryRetrievalStagesConfig = struct {
+    query_expansion_enabled: bool = false,
+    adaptive_retrieval_enabled: bool = false,
+    adaptive_keyword_max_tokens: u32 = 3,
+    adaptive_vector_min_tokens: u32 = 6,
+    llm_reranker_enabled: bool = false,
+    llm_reranker_max_candidates: u32 = 10,
+    llm_reranker_timeout_ms: u32 = 5_000,
+};
+
+pub const MemorySummarizerConfig = struct {
+    enabled: bool = false,
+    window_size_tokens: u32 = 4000,
+    summary_max_tokens: u32 = 500,
+    auto_extract_semantic: bool = true,
 };
 
 // ── Tunnel config ───────────────────────────────────────────────
@@ -516,7 +773,7 @@ pub const HttpRequestConfig = struct {
 // ── Identity config ─────────────────────────────────────────────
 
 pub const IdentityConfig = struct {
-    format: []const u8 = "openclaw",
+    format: []const u8 = "nullclaw",
     aieos_path: ?[]const u8 = null,
     aieos_inline: ?[]const u8 = null,
 };

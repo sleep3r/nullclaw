@@ -1,9 +1,17 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const providers = @import("../providers/root.zig");
 const Tool = @import("../tools/root.zig").Tool;
 const skills_mod = @import("../skills.zig");
 const spawn_tool_mod = @import("../tools/spawn.zig");
 const subagent_mod = @import("../subagent.zig");
+const memory_mod = @import("../memory/root.zig");
+const config_types = @import("../config_types.zig");
+const config_module = @import("../config.zig");
+const capabilities_mod = @import("../capabilities.zig");
+const config_mutator = @import("../config_mutator.zig");
+const context_tokens = @import("context_tokens.zig");
+const max_tokens_resolver = @import("max_tokens.zig");
 
 const SlashCommand = struct {
     name: []const u8,
@@ -22,7 +30,12 @@ fn parseSlashCommand(message: []const u8) ?SlashCommand {
     }
     if (split_idx == 0) return null;
 
-    const name = body[0..split_idx];
+    const raw_name = body[0..split_idx];
+    const name = if (std.mem.indexOfScalar(u8, raw_name, '@')) |mention_sep|
+        raw_name[0..mention_sep]
+    else
+        raw_name;
+    if (name.len == 0) return null;
     var rest = body[split_idx..];
     if (rest.len > 0 and rest[0] == ':') {
         rest = rest[1..];
@@ -43,10 +56,336 @@ fn firstToken(arg: []const u8) []const u8 {
     return it.next() orelse "";
 }
 
+fn parsePositiveUsize(raw: []const u8) ?usize {
+    const n = std.fmt.parseInt(usize, raw, 10) catch return null;
+    if (n == 0) return null;
+    return n;
+}
+
+fn isInternalMemoryKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "autosave_user_") or
+        std.mem.startsWith(u8, key, "autosave_assistant_") or
+        std.mem.eql(u8, key, "last_hygiene_at");
+}
+
+fn extractMarkdownMemoryKey(content: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, content, " \t");
+    if (!std.mem.startsWith(u8, trimmed, "**")) return null;
+    const rest = trimmed[2..];
+    const suffix = std.mem.indexOf(u8, rest, "**:") orelse return null;
+    if (suffix == 0) return null;
+    return rest[0..suffix];
+}
+
+fn isInternalMemoryEntryKeyOrContent(key: []const u8, content: []const u8) bool {
+    if (isInternalMemoryKey(key)) return true;
+    if (extractMarkdownMemoryKey(content)) |extracted| {
+        if (isInternalMemoryKey(extracted)) return true;
+    }
+    return false;
+}
+
+fn memoryRuntimePtr(self: anytype) ?*memory_mod.MemoryRuntime {
+    return if (@hasField(@TypeOf(self.*), "mem_rt")) self.mem_rt else null;
+}
+
 fn setModelName(self: anytype, model: []const u8) !void {
+    const owned_model = try self.allocator.dupe(u8, model);
     if (self.model_name_owned) self.allocator.free(self.model_name);
-    self.model_name = try self.allocator.dupe(u8, model);
+    self.model_name = owned_model;
     self.model_name_owned = true;
+
+    if (@hasField(@TypeOf(self.*), "token_limit")) {
+        const token_limit_override: ?u64 = if (@hasField(@TypeOf(self.*), "token_limit_override"))
+            self.token_limit_override
+        else
+            null;
+        self.token_limit = context_tokens.resolveContextTokens(token_limit_override, self.model_name);
+    }
+
+    if (@hasField(@TypeOf(self.*), "max_tokens")) {
+        const max_tokens_override: ?u32 = if (@hasField(@TypeOf(self.*), "max_tokens_override"))
+            self.max_tokens_override
+        else
+            null;
+        var resolved_max_tokens = max_tokens_resolver.resolveMaxTokens(max_tokens_override, self.model_name);
+        if (@hasField(@TypeOf(self.*), "token_limit")) {
+            const token_limit_cap: u32 = @intCast(@min(self.token_limit, @as(u64, std.math.maxInt(u32))));
+            resolved_max_tokens = @min(resolved_max_tokens, token_limit_cap);
+        }
+        self.max_tokens = resolved_max_tokens;
+    }
+}
+
+fn setDefaultProvider(self: anytype, provider_name: []const u8) !void {
+    if (!@hasField(@TypeOf(self.*), "default_provider")) return;
+    const owned_provider = try self.allocator.dupe(u8, provider_name);
+    if (@hasField(@TypeOf(self.*), "default_provider_owned")) {
+        if (self.default_provider_owned) self.allocator.free(self.default_provider);
+        self.default_provider_owned = true;
+    }
+    self.default_provider = owned_provider;
+}
+
+fn isConfiguredProviderName(self: anytype, provider_name: []const u8) bool {
+    if (!@hasField(@TypeOf(self.*), "configured_providers")) return false;
+    for (self.configured_providers) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.name, provider_name)) return true;
+    }
+    return false;
+}
+
+fn hasExplicitProviderPrefix(self: anytype, model: []const u8) bool {
+    const slash = std.mem.indexOfScalar(u8, model, '/') orelse return false;
+    if (slash == 0 or slash + 1 >= model.len) return false;
+
+    const provider_candidate = model[0..slash];
+    if (providers.classifyProvider(provider_candidate) != .unknown) return true;
+
+    var lower_buf: [128]u8 = undefined;
+    if (provider_candidate.len <= lower_buf.len) {
+        _ = std.ascii.lowerString(lower_buf[0..provider_candidate.len], provider_candidate);
+        if (providers.classifyProvider(lower_buf[0..provider_candidate.len]) != .unknown) return true;
+    }
+
+    return isConfiguredProviderName(self, provider_candidate);
+}
+
+fn configPrimaryModelForSelection(self: anytype, model: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, model, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidPath;
+
+    if (hasExplicitProviderPrefix(self, trimmed)) {
+        return try self.allocator.dupe(u8, trimmed);
+    }
+
+    const provider = if (@hasField(@TypeOf(self.*), "default_provider") and self.default_provider.len > 0)
+        self.default_provider
+    else
+        "openrouter";
+    return try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ provider, trimmed });
+}
+
+fn persistSelectedModelToConfig(self: anytype, model: []const u8) !void {
+    if (builtin.is_test) return;
+
+    const primary = try configPrimaryModelForSelection(self, model);
+    defer self.allocator.free(primary);
+
+    var result = try config_mutator.mutateDefaultConfig(
+        self.allocator,
+        .set,
+        "agents.defaults.model.primary",
+        primary,
+        .{ .apply = true },
+    );
+    defer config_mutator.freeMutationResult(self.allocator, &result);
+}
+
+fn invalidateSystemPromptCache(self: anytype) void {
+    if (@hasField(@TypeOf(self.*), "has_system_prompt")) {
+        self.has_system_prompt = false;
+    }
+}
+
+test "configPrimaryModelForSelection treats unknown leading segment as model for default provider" {
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        default_provider: []const u8,
+        configured_providers: []const config_types.ProviderEntry,
+    }{
+        .allocator = allocator,
+        .default_provider = "openrouter",
+        .configured_providers = &.{},
+    };
+
+    const primary = try configPrimaryModelForSelection(&dummy, "inception/mercury");
+    defer allocator.free(primary);
+    try std.testing.expectEqualStrings("openrouter/inception/mercury", primary);
+}
+
+test "configPrimaryModelForSelection keeps explicit known provider prefix" {
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        default_provider: []const u8,
+        configured_providers: []const config_types.ProviderEntry,
+    }{
+        .allocator = allocator,
+        .default_provider = "openrouter",
+        .configured_providers = &.{},
+    };
+
+    const primary = try configPrimaryModelForSelection(&dummy, "openrouter/inception/mercury");
+    defer allocator.free(primary);
+    try std.testing.expectEqualStrings("openrouter/inception/mercury", primary);
+}
+
+test "configPrimaryModelForSelection treats known provider prefix case-insensitively" {
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        default_provider: []const u8,
+        configured_providers: []const config_types.ProviderEntry,
+    }{
+        .allocator = allocator,
+        .default_provider = "openrouter",
+        .configured_providers = &.{},
+    };
+
+    const primary = try configPrimaryModelForSelection(&dummy, "OpenRouter/inception/mercury");
+    defer allocator.free(primary);
+    try std.testing.expectEqualStrings("OpenRouter/inception/mercury", primary);
+}
+
+test "configPrimaryModelForSelection keeps explicit configured custom provider prefix" {
+    const allocator = std.testing.allocator;
+    const configured = [_]config_types.ProviderEntry{
+        .{ .name = "customgw", .base_url = "https://example.com/v1" },
+    };
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        default_provider: []const u8,
+        configured_providers: []const config_types.ProviderEntry,
+    }{
+        .allocator = allocator,
+        .default_provider = "openrouter",
+        .configured_providers = &configured,
+    };
+
+    const primary = try configPrimaryModelForSelection(&dummy, "customgw/model-a");
+    defer allocator.free(primary);
+    try std.testing.expectEqualStrings("customgw/model-a", primary);
+}
+
+test "parseSlashCommand strips bot mention from command name" {
+    const parsed = parseSlashCommand("/model@nullclaw_bot openrouter/inception/mercury") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("model", parsed.name);
+    try std.testing.expectEqualStrings("openrouter/inception/mercury", parsed.arg);
+}
+
+test "parseSlashCommand strips bot mention with colon separator" {
+    const parsed = parseSlashCommand("/model@nullclaw_bot: gpt-5.2") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("model", parsed.name);
+    try std.testing.expectEqualStrings("gpt-5.2", parsed.arg);
+}
+
+test "hotApplyConfigChange updates model primary as provider plus model" {
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+    }{
+        .allocator = allocator,
+        .model_name = "old-model",
+        .model_name_owned = false,
+        .default_provider = "old-provider",
+        .default_provider_owned = false,
+        .default_model = "old-model",
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+
+    const applied = try hotApplyConfigChange(
+        &dummy,
+        .set,
+        "agents.defaults.model.primary",
+        "\"openrouter/inception/mercury\"",
+    );
+    try std.testing.expect(applied);
+    try std.testing.expectEqualStrings("inception/mercury", dummy.model_name);
+    try std.testing.expectEqualStrings("inception/mercury", dummy.default_model);
+    try std.testing.expectEqualStrings("openrouter", dummy.default_provider);
+}
+
+test "hotApplyConfigChange rejects malformed model primary" {
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+    }{
+        .allocator = allocator,
+        .model_name = "stable-model",
+        .model_name_owned = false,
+        .default_provider = "openrouter",
+        .default_provider_owned = false,
+        .default_model = "stable-model",
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+
+    const applied = try hotApplyConfigChange(
+        &dummy,
+        .set,
+        "agents.defaults.model.primary",
+        "\"malformed\"",
+    );
+    try std.testing.expect(!applied);
+    try std.testing.expectEqualStrings("stable-model", dummy.model_name);
+    try std.testing.expectEqualStrings("openrouter", dummy.default_provider);
+}
+
+test "hotApplyConfigChange model primary refreshes token and max token limits" {
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+        token_limit: u64,
+        token_limit_override: ?u64,
+        max_tokens: u32,
+        max_tokens_override: ?u32,
+    }{
+        .allocator = allocator,
+        .model_name = "old-model",
+        .model_name_owned = false,
+        .default_provider = "old-provider",
+        .default_provider_owned = false,
+        .default_model = "old-model",
+        .token_limit = 1024,
+        .token_limit_override = null,
+        .max_tokens = 128,
+        .max_tokens_override = null,
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+
+    const applied = try hotApplyConfigChange(
+        &dummy,
+        .set,
+        "agents.defaults.model.primary",
+        "\"openrouter/gpt-4o\"",
+    );
+    try std.testing.expect(applied);
+    try std.testing.expectEqualStrings("gpt-4o", dummy.model_name);
+    try std.testing.expectEqualStrings("gpt-4o", dummy.default_model);
+    try std.testing.expectEqualStrings("openrouter", dummy.default_provider);
+    try std.testing.expectEqual(@as(u64, 128_000), dummy.token_limit);
+    try std.testing.expectEqual(@as(u32, 8192), dummy.max_tokens);
+}
+
+test "splitPrimaryModelRef parses provider model format" {
+    const parsed = splitPrimaryModelRef("openrouter/inception/mercury") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("openrouter", parsed.provider);
+    try std.testing.expectEqualStrings("inception/mercury", parsed.model);
+}
+
+test "splitPrimaryModelRef rejects malformed values" {
+    try std.testing.expect(splitPrimaryModelRef("noslash") == null);
+    try std.testing.expect(splitPrimaryModelRef("/model-only") == null);
+    try std.testing.expect(splitPrimaryModelRef("provider/") == null);
 }
 
 fn setExecNodeId(self: anytype, value: ?[]const u8) !void {
@@ -145,6 +484,12 @@ fn findSubagentManager(self: anytype) ?*subagent_mod.SubagentManager {
     return spawn_tool.manager;
 }
 
+pub fn refreshSubagentToolContext(self: anytype) void {
+    const spawn_tool = findSpawnTool(self) orelse return;
+    spawn_tool.default_channel = "agent";
+    spawn_tool.default_chat_id = self.memory_session_id orelse "agent";
+}
+
 fn findShellTool(self: anytype) ?Tool {
     for (self.tools) |t| {
         if (std.ascii.eqlIgnoreCase(t.name(), "shell")) return t;
@@ -156,10 +501,8 @@ fn clearSessionState(self: anytype) void {
     self.clearHistory();
     clearPendingExecCommand(self);
 
-    if (self.mem) |mem| {
-        if (mem.asSqlite()) |sqlite_mem| {
-            sqlite_mem.clearAutoSaved(self.memory_session_id) catch {};
-        }
+    if (self.session_store) |store| {
+        store.clearAutoSaved(self.memory_session_id) catch {};
     }
 }
 
@@ -918,12 +1261,22 @@ fn taskStatusLabel(status: subagent_mod.TaskStatus) []const u8 {
     };
 }
 
+fn currentSubagentSessionKey(self: anytype) []const u8 {
+    return self.memory_session_id orelse "agent";
+}
+
+fn taskBelongsToCurrentSession(self: anytype, state: *const subagent_mod.TaskState) bool {
+    const task_session = state.session_key orelse return false;
+    return std.mem.eql(u8, task_session, currentSubagentSessionKey(self));
+}
+
 fn freeSubagentTaskState(manager: *subagent_mod.SubagentManager, state: *subagent_mod.TaskState) void {
     if (state.thread) |thread| {
         thread.join();
     }
     if (state.result) |r| manager.allocator.free(r);
     if (state.error_msg) |e| manager.allocator.free(e);
+    if (state.session_key) |sk| manager.allocator.free(sk);
     manager.allocator.free(state.label);
     manager.allocator.destroy(state);
 }
@@ -939,19 +1292,17 @@ fn formatSubagentList(self: anytype, include_details: bool) ![]const u8 {
     manager.mutex.lock();
     defer manager.mutex.unlock();
 
-    if (manager.tasks.count() == 0) {
-        try w.writeAll("No subagents tracked in this session.");
-        return try out.toOwnedSlice(self.allocator);
-    }
-
     var running: u32 = 0;
     var completed: u32 = 0;
     var failed: u32 = 0;
+    var visible_count: u32 = 0;
 
     var it = manager.tasks.iterator();
     while (it.next()) |entry| {
         const task_id = entry.key_ptr.*;
         const state = entry.value_ptr.*;
+        if (!taskBelongsToCurrentSession(self, state)) continue;
+        visible_count += 1;
         switch (state.status) {
             .running => running += 1,
             .completed => completed += 1,
@@ -963,6 +1314,11 @@ fn formatSubagentList(self: anytype, include_details: bool) ![]const u8 {
             try w.print(" error={s}", .{state.error_msg.?});
         }
         try w.writeAll("\n");
+    }
+
+    if (visible_count == 0) {
+        try w.writeAll("No subagents tracked in this session.");
+        return try out.toOwnedSlice(self.allocator);
     }
 
     try w.print("Totals: running={d}, completed={d}, failed={d}", .{ running, completed, failed });
@@ -1005,6 +1361,7 @@ fn handleAgentsCommand(self: anytype) ![]const u8 {
     var it = manager.tasks.iterator();
     while (it.next()) |entry| {
         const state = entry.value_ptr.*;
+        if (!taskBelongsToCurrentSession(self, state)) continue;
         tracked += 1;
         if (state.status == .running) running += 1;
     }
@@ -1037,6 +1394,7 @@ fn handleKillCommand(self: anytype, arg: []const u8) ![]const u8 {
         while (it.next()) |entry| {
             const task_id = entry.key_ptr.*;
             const state = entry.value_ptr.*;
+            if (!taskBelongsToCurrentSession(self, state)) continue;
             if (state.status == .running) {
                 running += 1;
             } else {
@@ -1070,6 +1428,9 @@ fn handleKillCommand(self: anytype, arg: []const u8) ![]const u8 {
 
     const state = manager.tasks.get(task_id) orelse
         return try std.fmt.allocPrint(self.allocator, "Task #{d} not found.", .{task_id});
+    if (!taskBelongsToCurrentSession(self, state)) {
+        return try std.fmt.allocPrint(self.allocator, "Task #{d} not found.", .{task_id});
+    }
     if (state.status == .running) {
         return try std.fmt.allocPrint(
             self.allocator,
@@ -1117,6 +1478,9 @@ fn handleSubagentsCommand(self: anytype, arg: []const u8) ![]const u8 {
 
         const state = manager.tasks.get(task_id) orelse
             return try std.fmt.allocPrint(self.allocator, "Task #{d} not found.", .{task_id});
+        if (!taskBelongsToCurrentSession(self, state)) {
+            return try std.fmt.allocPrint(self.allocator, "Task #{d} not found.", .{task_id});
+        }
 
         if (state.status == .running) {
             return try std.fmt.allocPrint(
@@ -1160,6 +1524,16 @@ fn handleSteerCommand(self: anytype, arg: []const u8) ![]const u8 {
         return try self.allocator.dupe(u8, "Usage: /steer <id> <message>");
     if (message.len == 0) return try self.allocator.dupe(u8, "Usage: /steer <id> <message>");
 
+    if (findSubagentManager(self)) |manager| {
+        manager.mutex.lock();
+        defer manager.mutex.unlock();
+        const state = manager.tasks.get(task_id) orelse
+            return try std.fmt.allocPrint(self.allocator, "Task #{d} not found.", .{task_id});
+        if (!taskBelongsToCurrentSession(self, state)) {
+            return try std.fmt.allocPrint(self.allocator, "Task #{d} not found.", .{task_id});
+        }
+    }
+
     const follow_up = try std.fmt.allocPrint(
         self.allocator,
         "Follow up for task #{d}: {s}",
@@ -1194,20 +1568,24 @@ fn handlePollCommand(self: anytype) ![]const u8 {
     if (findSubagentManager(self)) |manager| {
         manager.mutex.lock();
         defer manager.mutex.unlock();
-        if (manager.tasks.count() > 0) {
-            wrote_any = true;
-            var running: u32 = 0;
-            var completed: u32 = 0;
-            var failed: u32 = 0;
+        var running: u32 = 0;
+        var completed: u32 = 0;
+        var failed: u32 = 0;
+        var visible: u32 = 0;
 
-            var it = manager.tasks.iterator();
-            while (it.next()) |entry| {
-                switch (entry.value_ptr.*.status) {
-                    .running => running += 1,
-                    .completed => completed += 1,
-                    .failed => failed += 1,
-                }
+        var it = manager.tasks.iterator();
+        while (it.next()) |entry| {
+            const state = entry.value_ptr.*;
+            if (!taskBelongsToCurrentSession(self, state)) continue;
+            visible += 1;
+            switch (state.status) {
+                .running => running += 1,
+                .completed => completed += 1,
+                .failed => failed += 1,
             }
+        }
+        if (visible > 0) {
+            wrote_any = true;
             try w.print(
                 "Subagent tasks: running={d}, completed={d}, failed={d}\n",
                 .{ running, completed, failed },
@@ -1229,7 +1607,17 @@ fn handleStopCommand(self: anytype) ![]const u8 {
     }
 
     if (findSubagentManager(self)) |manager| {
-        const running = manager.getRunningCount();
+        var running: u32 = 0;
+        manager.mutex.lock();
+        {
+            var it = manager.tasks.iterator();
+            while (it.next()) |entry| {
+                const state = entry.value_ptr.*;
+                if (!taskBelongsToCurrentSession(self, state)) continue;
+                if (state.status == .running) running += 1;
+            }
+        }
+        manager.mutex.unlock();
         if (running > 0) {
             if (cleared_pending) {
                 return try std.fmt.allocPrint(
@@ -1250,6 +1638,177 @@ fn handleStopCommand(self: anytype) ![]const u8 {
         return try self.allocator.dupe(u8, "Cleared pending exec approval.");
     }
     return try self.allocator.dupe(u8, "No active background task to stop.");
+}
+
+fn parseJsonStringOwned(allocator: std.mem.Allocator, raw: []const u8) !?[]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .string) return null;
+    return try allocator.dupe(u8, parsed.value.string);
+}
+
+fn parseJsonF64(raw: []const u8) ?f64 {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), raw, .{}) catch return null;
+    return switch (parsed.value) {
+        .float => |v| v,
+        .integer => |v| @floatFromInt(v),
+        else => null,
+    };
+}
+
+fn parseJsonU32(raw: []const u8) ?u32 {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), raw, .{}) catch return null;
+    return switch (parsed.value) {
+        .integer => |v| blk: {
+            if (v < 0 or v > std.math.maxInt(u32)) break :blk null;
+            break :blk @intCast(v);
+        },
+        else => null,
+    };
+}
+
+fn parseJsonU64(raw: []const u8) ?u64 {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), raw, .{}) catch return null;
+    return switch (parsed.value) {
+        .integer => |v| blk: {
+            if (v < 0 or v > std.math.maxInt(u64)) break :blk null;
+            break :blk @intCast(v);
+        },
+        else => null,
+    };
+}
+
+fn splitPrimaryModelRef(primary: []const u8) ?struct { provider: []const u8, model: []const u8 } {
+    const slash = std.mem.indexOfScalar(u8, primary, '/') orelse return null;
+    if (slash == 0 or slash + 1 >= primary.len) return null;
+    return .{
+        .provider = primary[0..slash],
+        .model = primary[slash + 1 ..],
+    };
+}
+
+fn hotApplyConfigChange(
+    self: anytype,
+    action: config_mutator.MutationAction,
+    path: []const u8,
+    new_value_json: []const u8,
+) !bool {
+    if (action == .unset) return false;
+
+    if (std.mem.eql(u8, path, "agents.defaults.model.primary")) {
+        const primary = try parseJsonStringOwned(self.allocator, new_value_json) orelse return false;
+        defer self.allocator.free(primary);
+        const parsed = splitPrimaryModelRef(primary) orelse return false;
+        try setModelName(self, parsed.model);
+        try setDefaultProvider(self, parsed.provider);
+        if (@hasField(@TypeOf(self.*), "default_model")) {
+            self.default_model = self.model_name;
+        }
+        return true;
+    }
+
+    if (std.mem.eql(u8, path, "default_temperature")) {
+        const temp = parseJsonF64(new_value_json) orelse return false;
+        if (@hasField(@TypeOf(self.*), "temperature")) {
+            self.temperature = temp;
+            return true;
+        }
+        return false;
+    }
+
+    if (std.mem.eql(u8, path, "agent.max_tool_iterations")) {
+        const v = parseJsonU32(new_value_json) orelse return false;
+        if (@hasField(@TypeOf(self.*), "max_tool_iterations")) {
+            self.max_tool_iterations = v;
+            return true;
+        }
+        return false;
+    }
+
+    if (std.mem.eql(u8, path, "agent.max_history_messages")) {
+        const v = parseJsonU32(new_value_json) orelse return false;
+        if (@hasField(@TypeOf(self.*), "max_history_messages")) {
+            self.max_history_messages = v;
+            return true;
+        }
+        return false;
+    }
+
+    if (std.mem.eql(u8, path, "agent.message_timeout_secs")) {
+        const v = parseJsonU64(new_value_json) orelse return false;
+        if (@hasField(@TypeOf(self.*), "message_timeout_secs")) {
+            self.message_timeout_secs = v;
+            return true;
+        }
+        return false;
+    }
+
+    return false;
+}
+
+fn formatConfigMutationResponse(
+    allocator: std.mem.Allocator,
+    action: config_mutator.MutationAction,
+    result: *const config_mutator.MutationResult,
+    dry_run: bool,
+    hot_applied: bool,
+) ![]const u8 {
+    const action_name = switch (action) {
+        .set => "set",
+        .unset => "unset",
+    };
+    const mode = if (dry_run) "preview" else "applied";
+    const restart_text = if (result.requires_restart) "true" else "false";
+    const hot_text = if (hot_applied) "true" else "false";
+    const backup = result.backup_path orelse "(none)";
+
+    return try std.fmt.allocPrint(
+        allocator,
+        "Config {s} ({s}):\\n" ++
+            "  action: {s}\\n" ++
+            "  path: {s}\\n" ++
+            "  old: {s}\\n" ++
+            "  new: {s}\\n" ++
+            "  requires_restart: {s}\\n" ++
+            "  hot_applied: {s}\\n" ++
+            "  backup: {s}\\n",
+        .{
+            action_name,
+            mode,
+            action_name,
+            result.path,
+            result.old_value_json,
+            result.new_value_json,
+            restart_text,
+            hot_text,
+            backup,
+        },
+    );
+}
+
+fn handleCapabilitiesCommand(self: anytype, arg: []const u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, arg, " \t");
+    const as_json = std.mem.eql(u8, trimmed, "--json") or std.ascii.eqlIgnoreCase(trimmed, "json");
+
+    var cfg_opt: ?config_module.Config = config_module.Config.load(self.allocator) catch null;
+    defer if (cfg_opt) |*cfg| cfg.deinit();
+    const cfg_ptr: ?*const config_module.Config = if (cfg_opt) |*cfg| cfg else null;
+
+    const runtime_tools: ?[]const Tool = if (@hasField(@TypeOf(self.*), "tools"))
+        self.tools
+    else
+        null;
+
+    if (as_json) {
+        return capabilities_mod.buildManifestJson(self.allocator, cfg_ptr, runtime_tools);
+    }
+    return capabilities_mod.buildSummaryText(self.allocator, cfg_ptr, runtime_tools);
 }
 
 fn handleConfigCommand(self: anytype, arg: []const u8) ![]const u8 {
@@ -1277,31 +1836,105 @@ fn handleConfigCommand(self: anytype, arg: []const u8) ![]const u8 {
     if (std.ascii.eqlIgnoreCase(action, "get")) {
         const key = std.mem.trim(u8, parsed.tail, " \t");
         if (key.len == 0) return try self.allocator.dupe(u8, "Usage: /config get <path>");
+        return config_mutator.getPathValueJson(self.allocator, key) catch |err| {
+            return try std.fmt.allocPrint(self.allocator, "Config get failed: {s}", .{@errorName(err)});
+        };
+    }
 
-        if (std.ascii.eqlIgnoreCase(key, "model")) return try std.fmt.allocPrint(self.allocator, "{s}", .{self.model_name});
-        if (std.ascii.eqlIgnoreCase(key, "workspace")) return try std.fmt.allocPrint(self.allocator, "{s}", .{self.workspace_dir});
-        if (std.ascii.eqlIgnoreCase(key, "exec.host")) return try std.fmt.allocPrint(self.allocator, "{s}", .{self.exec_host.toSlice()});
-        if (std.ascii.eqlIgnoreCase(key, "exec.security")) return try std.fmt.allocPrint(self.allocator, "{s}", .{self.exec_security.toSlice()});
-        if (std.ascii.eqlIgnoreCase(key, "exec.ask")) return try std.fmt.allocPrint(self.allocator, "{s}", .{self.exec_ask.toSlice()});
-        if (std.ascii.eqlIgnoreCase(key, "queue.mode")) return try std.fmt.allocPrint(self.allocator, "{s}", .{self.queue_mode.toSlice()});
-        if (std.ascii.eqlIgnoreCase(key, "tts.mode")) return try std.fmt.allocPrint(self.allocator, "{s}", .{self.tts_mode.toSlice()});
-        if (std.ascii.eqlIgnoreCase(key, "activation")) return try std.fmt.allocPrint(self.allocator, "{s}", .{self.activation_mode.toSlice()});
-        if (std.ascii.eqlIgnoreCase(key, "send")) return try std.fmt.allocPrint(self.allocator, "{s}", .{self.send_mode.toSlice()});
-        if (std.ascii.eqlIgnoreCase(key, "focus")) return try std.fmt.allocPrint(self.allocator, "{s}", .{self.focus_target orelse "off"});
-        if (std.ascii.eqlIgnoreCase(key, "dock")) return try std.fmt.allocPrint(self.allocator, "{s}", .{self.dock_target orelse "off"});
-        if (std.ascii.eqlIgnoreCase(key, "session.ttl")) {
-            if (self.session_ttl_secs) |ttl| return try std.fmt.allocPrint(self.allocator, "{d}", .{ttl});
-            return try self.allocator.dupe(u8, "off");
+    if (std.ascii.eqlIgnoreCase(action, "validate")) {
+        config_mutator.validateCurrentConfig(self.allocator) catch |err| {
+            return try std.fmt.allocPrint(self.allocator, "Config validation failed: {s}", .{@errorName(err)});
+        };
+        return try self.allocator.dupe(u8, "Config validation: OK");
+    }
+
+    if (std.ascii.eqlIgnoreCase(action, "set")) {
+        const path_and_value = splitFirstToken(parsed.tail);
+        const path = path_and_value.head;
+        const value_raw = std.mem.trim(u8, path_and_value.tail, " \t");
+        if (path.len == 0 or value_raw.len == 0) {
+            return try self.allocator.dupe(u8, "Usage: /config set <path> <value> (dry-run preview)");
         }
 
-        return try std.fmt.allocPrint(self.allocator, "Unknown config path: {s}", .{key});
+        var result = config_mutator.mutateDefaultConfig(self.allocator, .set, path, value_raw, .{ .apply = false }) catch |err| {
+            return try std.fmt.allocPrint(self.allocator, "Config set preview failed: {s}", .{@errorName(err)});
+        };
+        defer config_mutator.freeMutationResult(self.allocator, &result);
+
+        const response = try formatConfigMutationResponse(self.allocator, .set, &result, true, false);
+        return response;
     }
 
-    if (std.ascii.eqlIgnoreCase(action, "set") or std.ascii.eqlIgnoreCase(action, "unset")) {
-        return try self.allocator.dupe(u8, "Config writes are not available from chat in this runtime. Use dedicated slash commands or edit config.json.");
+    if (std.ascii.eqlIgnoreCase(action, "unset")) {
+        const path = std.mem.trim(u8, parsed.tail, " \t");
+        if (path.len == 0) {
+            return try self.allocator.dupe(u8, "Usage: /config unset <path> (dry-run preview)");
+        }
+
+        var result = config_mutator.mutateDefaultConfig(self.allocator, .unset, path, null, .{ .apply = false }) catch |err| {
+            return try std.fmt.allocPrint(self.allocator, "Config unset preview failed: {s}", .{@errorName(err)});
+        };
+        defer config_mutator.freeMutationResult(self.allocator, &result);
+
+        const response = try formatConfigMutationResponse(self.allocator, .unset, &result, true, false);
+        return response;
     }
 
-    return try self.allocator.dupe(u8, "Usage: /config [show] | /config get <path>");
+    if (std.ascii.eqlIgnoreCase(action, "apply")) {
+        const apply_parsed = splitFirstToken(parsed.tail);
+        const apply_action = apply_parsed.head;
+        const apply_rest = apply_parsed.tail;
+
+        if (std.ascii.eqlIgnoreCase(apply_action, "set")) {
+            const path_and_value = splitFirstToken(apply_rest);
+            const path = path_and_value.head;
+            const value_raw = std.mem.trim(u8, path_and_value.tail, " \t");
+            if (path.len == 0 or value_raw.len == 0) {
+                return try self.allocator.dupe(u8, "Usage: /config apply set <path> <value>");
+            }
+
+            var result = config_mutator.mutateDefaultConfig(self.allocator, .set, path, value_raw, .{ .apply = true }) catch |err| {
+                return try std.fmt.allocPrint(self.allocator, "Config apply set failed: {s}", .{@errorName(err)});
+            };
+            defer config_mutator.freeMutationResult(self.allocator, &result);
+
+            var hot_applied = false;
+            if (result.applied and !result.requires_restart) {
+                hot_applied = hotApplyConfigChange(self, .set, result.path, result.new_value_json) catch false;
+            }
+            const response = try formatConfigMutationResponse(self.allocator, .set, &result, false, hot_applied);
+            return response;
+        }
+
+        if (std.ascii.eqlIgnoreCase(apply_action, "unset")) {
+            const path = std.mem.trim(u8, apply_rest, " \t");
+            if (path.len == 0) {
+                return try self.allocator.dupe(u8, "Usage: /config apply unset <path>");
+            }
+
+            var result = config_mutator.mutateDefaultConfig(self.allocator, .unset, path, null, .{ .apply = true }) catch |err| {
+                return try std.fmt.allocPrint(self.allocator, "Config apply unset failed: {s}", .{@errorName(err)});
+            };
+            defer config_mutator.freeMutationResult(self.allocator, &result);
+
+            const response = try formatConfigMutationResponse(self.allocator, .unset, &result, false, false);
+            return response;
+        }
+
+        return try self.allocator.dupe(u8, "Usage: /config apply <set|unset> ...");
+    }
+
+    return try self.allocator.dupe(
+        u8,
+        "Usage:\n" ++
+            "  /config [show]\n" ++
+            "  /config get <path>\n" ++
+            "  /config set <path> <value>            (dry-run preview)\n" ++
+            "  /config unset <path>                  (dry-run preview)\n" ++
+            "  /config apply set <path> <value>\n" ++
+            "  /config apply unset <path>\n" ++
+            "  /config validate",
+    );
 }
 
 fn handleSkillCommand(self: anytype, arg: []const u8) ![]const u8 {
@@ -1476,6 +2109,15 @@ pub fn composeFinalReply(
     return try out.toOwnedSlice(self.allocator);
 }
 
+fn handleDoctorCommand(self: anytype) ![]const u8 {
+    const rt: ?*memory_mod.MemoryRuntime = if (@hasField(@TypeOf(self.*), "mem_rt")) self.mem_rt else null;
+    if (rt) |mem_rt| {
+        const report = memory_mod.diagnostics.diagnose(mem_rt);
+        return memory_mod.diagnostics.formatReport(report, self.allocator);
+    }
+    return try self.allocator.dupe(u8, "Memory runtime not available. Diagnostics require a configured memory backend.");
+}
+
 pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
     const cmd = parseSlashCommand(message) orelse return null;
 
@@ -1511,9 +2153,11 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
             \\  /export-session, /export
             \\  /session ttl <duration|off>
             \\  /subagents, /agents, /focus, /unfocus, /kill, /steer, /tell
-            \\  /config, /debug
+            \\  /config, /capabilities, /debug
             \\  /dock-telegram, /dock-discord, /dock-slack
             \\  /activation, /send, /elevated, /bash, /poll, /skill
+            \\  /doctor — memory subsystem diagnostics
+            \\  /memory <stats|status|reindex|count|search|get|list|drain-outbox>
             \\  exit, quit
         );
     }
@@ -1528,6 +2172,17 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
             return try self.formatModelStatus();
         }
         try setModelName(self, cmd.arg);
+        if (@hasField(@TypeOf(self.*), "default_model")) {
+            self.default_model = self.model_name;
+        }
+        invalidateSystemPromptCache(self);
+        persistSelectedModelToConfig(self, cmd.arg) catch |err| {
+            return try std.fmt.allocPrint(
+                self.allocator,
+                "Switched to model: {s}\nWarning: could not persist model to config.json ({s})",
+                .{ cmd.arg, @errorName(err) },
+            );
+        };
         return try std.fmt.allocPrint(self.allocator, "Switched to model: {s}", .{cmd.arg});
     }
 
@@ -1560,6 +2215,7 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
     if (isSlashName(cmd, "tell")) return try handleTellCommand(self, cmd.arg);
 
     if (isSlashName(cmd, "config")) return try handleConfigCommand(self, cmd.arg);
+    if (isSlashName(cmd, "capabilities")) return try handleCapabilitiesCommand(self, cmd.arg);
     if (isSlashName(cmd, "debug")) {
         if (std.ascii.eqlIgnoreCase(cmd.arg, "show") or cmd.arg.len == 0) return try formatStatus(self);
         if (std.ascii.eqlIgnoreCase(cmd.arg, "reset")) {
@@ -1579,6 +2235,197 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
     if (isSlashName(cmd, "bash")) return try handleBashCommand(self, cmd.arg);
     if (isSlashName(cmd, "poll")) return try handlePollCommand(self);
     if (isSlashName(cmd, "skill")) return try handleSkillCommand(self, cmd.arg);
+    if (isSlashName(cmd, "doctor")) return try handleDoctorCommand(self);
+    if (isSlashName(cmd, "memory")) return try handleMemoryCommand(self, cmd.arg);
 
     return null;
+}
+
+fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
+    const usage =
+        "Usage: /memory <stats|status|reindex|count|search|get|list|drain-outbox>\n" ++
+        "  /memory search <query> [--limit N]\n" ++
+        "  /memory get <key>\n" ++
+        "  /memory list [--category C] [--limit N] [--include-internal]";
+
+    const parsed = splitFirstToken(arg);
+    const sub = parsed.head;
+    const rest = parsed.tail;
+
+    if (sub.len == 0) return try self.allocator.dupe(u8, usage);
+
+    if (std.mem.eql(u8, sub, "doctor") or std.mem.eql(u8, sub, "status")) {
+        return try handleDoctorCommand(self);
+    }
+
+    const mem_rt = memoryRuntimePtr(self) orelse {
+        return try self.allocator.dupe(u8, "Memory runtime not available.");
+    };
+
+    if (std.mem.eql(u8, sub, "stats")) {
+        const r = mem_rt.resolved;
+        const report = mem_rt.diagnose();
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        const w = out.writer(self.allocator);
+        try w.print("Memory resolved config:\n", .{});
+        try w.print("  backend: {s}\n", .{r.primary_backend});
+        try w.print("  retrieval: {s}\n", .{r.retrieval_mode});
+        try w.print("  vector: {s}\n", .{r.vector_mode});
+        try w.print("  embedding: {s}\n", .{r.embedding_provider});
+        try w.print("  rollout: {s}\n", .{r.rollout_mode});
+        try w.print("  sync: {s}\n", .{r.vector_sync_mode});
+        try w.print("  sources: {d}\n", .{r.source_count});
+        try w.print("  fallback: {s}\n", .{r.fallback_policy});
+        try w.print("  entries: {d}\n", .{report.entry_count});
+        if (report.vector_entry_count) |n| {
+            try w.print("  vector_entries: {d}\n", .{n});
+        } else {
+            try w.print("  vector_entries: n/a\n", .{});
+        }
+        if (report.outbox_pending) |n| {
+            try w.print("  outbox_pending: {d}\n", .{n});
+        } else {
+            try w.print("  outbox_pending: n/a\n", .{});
+        }
+        return try out.toOwnedSlice(self.allocator);
+    }
+
+    if (std.mem.eql(u8, sub, "count")) {
+        const count = mem_rt.memory.count() catch |err| {
+            return try std.fmt.allocPrint(self.allocator, "Memory count failed: {s}", .{@errorName(err)});
+        };
+        return try std.fmt.allocPrint(self.allocator, "{d}", .{count});
+    }
+
+    if (std.mem.eql(u8, sub, "reindex")) {
+        const count = mem_rt.reindex(self.allocator);
+        if (std.mem.eql(u8, mem_rt.resolved.vector_mode, "none")) {
+            return try self.allocator.dupe(u8, "Vector plane is disabled; reindex skipped (0 entries).");
+        }
+        return try std.fmt.allocPrint(self.allocator, "Reindex complete: {d} entries reindexed.", .{count});
+    }
+
+    if (std.mem.eql(u8, sub, "drain-outbox") or std.mem.eql(u8, sub, "drain_outbox")) {
+        const drained = mem_rt.drainOutbox(self.allocator);
+        return try std.fmt.allocPrint(self.allocator, "Outbox drain complete: {d} operation(s) processed.", .{drained});
+    }
+
+    if (std.mem.eql(u8, sub, "get")) {
+        const key = std.mem.trim(u8, rest, " \t");
+        if (key.len == 0) return try self.allocator.dupe(u8, "Usage: /memory get <key>");
+        const entry = mem_rt.memory.get(self.allocator, key) catch |err| {
+            return try std.fmt.allocPrint(self.allocator, "Memory get failed: {s}", .{@errorName(err)});
+        };
+        if (entry) |e| {
+            defer e.deinit(self.allocator);
+            return try std.fmt.allocPrint(
+                self.allocator,
+                "key: {s}\ncategory: {s}\ntimestamp: {s}\ncontent:\n{s}",
+                .{ e.key, e.category.toString(), e.timestamp, e.content },
+            );
+        }
+        return try std.fmt.allocPrint(self.allocator, "Not found: {s}", .{key});
+    }
+
+    if (std.mem.eql(u8, sub, "search")) {
+        var limit: usize = 6;
+        var query_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer query_buf.deinit(self.allocator);
+
+        var it = std.mem.tokenizeAny(u8, rest, " \t");
+        while (it.next()) |tok| {
+            if (std.mem.eql(u8, tok, "--limit")) {
+                const next = it.next() orelse return try self.allocator.dupe(u8, "Usage: /memory search <query> [--limit N]");
+                limit = parsePositiveUsize(next) orelse return try std.fmt.allocPrint(self.allocator, "Invalid --limit value: {s}", .{next});
+                continue;
+            }
+            if (query_buf.items.len > 0) try query_buf.append(self.allocator, ' ');
+            try query_buf.appendSlice(self.allocator, tok);
+        }
+
+        const query = std.mem.trim(u8, query_buf.items, " \t");
+        if (query.len == 0) return try self.allocator.dupe(u8, "Usage: /memory search <query> [--limit N]");
+
+        const results = mem_rt.search(self.allocator, query, limit, null) catch |err| {
+            return try std.fmt.allocPrint(self.allocator, "Memory search failed: {s}", .{@errorName(err)});
+        };
+        defer memory_mod.retrieval.freeCandidates(self.allocator, results);
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        const w = out.writer(self.allocator);
+        try w.print("Search results: {d}\n", .{results.len});
+        for (results, 0..) |c, idx| {
+            try w.print("  {d}. {s} [{s}] score={d:.4}", .{ idx + 1, c.key, c.category.toString(), c.final_score });
+            if (c.vector_score) |vs| {
+                try w.print(" vector_score={d:.4}", .{vs});
+            } else {
+                try w.print(" vector_score=n/a", .{});
+            }
+            try w.print(" source={s}\n", .{c.source});
+            const preview_len = @min(@as(usize, 140), c.snippet.len);
+            const preview = c.snippet[0..preview_len];
+            try w.print("     {s}{s}\n", .{ preview, if (c.snippet.len > preview_len) "..." else "" });
+        }
+        return try out.toOwnedSlice(self.allocator);
+    }
+
+    if (std.mem.eql(u8, sub, "list")) {
+        var limit: usize = 20;
+        var category_opt: ?memory_mod.MemoryCategory = null;
+        var include_internal = false;
+        var it = std.mem.tokenizeAny(u8, rest, " \t");
+        while (it.next()) |tok| {
+            if (std.mem.eql(u8, tok, "--limit")) {
+                const next = it.next() orelse return try self.allocator.dupe(u8, "Usage: /memory list [--category C] [--limit N] [--include-internal]");
+                limit = parsePositiveUsize(next) orelse return try std.fmt.allocPrint(self.allocator, "Invalid --limit value: {s}", .{next});
+                continue;
+            }
+            if (std.mem.eql(u8, tok, "--category")) {
+                const next = it.next() orelse return try self.allocator.dupe(u8, "Usage: /memory list [--category C] [--limit N] [--include-internal]");
+                category_opt = memory_mod.MemoryCategory.fromString(next);
+                continue;
+            }
+            if (std.mem.eql(u8, tok, "--include-internal")) {
+                include_internal = true;
+                continue;
+            }
+            return try std.fmt.allocPrint(self.allocator, "Unknown option for /memory list: {s}", .{tok});
+        }
+
+        const entries = mem_rt.memory.list(self.allocator, category_opt, null) catch |err| {
+            return try std.fmt.allocPrint(self.allocator, "Memory list failed: {s}", .{@errorName(err)});
+        };
+        defer memory_mod.freeEntries(self.allocator, entries);
+
+        var filtered_total: usize = 0;
+        for (entries) |entry| {
+            if (!include_internal and isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) continue;
+            filtered_total += 1;
+        }
+
+        if (filtered_total == 0) {
+            return try self.allocator.dupe(u8, "No memory entries found.");
+        }
+
+        const shown = @min(limit, filtered_total);
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        const w = out.writer(self.allocator);
+        try w.print("Memory entries: showing {d}/{d}\n", .{ shown, filtered_total });
+        var written: usize = 0;
+        for (entries) |e| {
+            if (!include_internal and isInternalMemoryEntryKeyOrContent(e.key, e.content)) continue;
+            if (written >= shown) break;
+            const preview_len = @min(@as(usize, 120), e.content.len);
+            const preview = e.content[0..preview_len];
+            try w.print("  {d}. {s} [{s}] {s}\n", .{ written + 1, e.key, e.category.toString(), e.timestamp });
+            try w.print("     {s}{s}\n", .{ preview, if (e.content.len > preview_len) "..." else "" });
+            written += 1;
+        }
+        return try out.toOwnedSlice(self.allocator);
+    }
+
+    return try self.allocator.dupe(u8, usage);
 }

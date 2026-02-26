@@ -16,7 +16,61 @@ pub const PromptContext = struct {
     workspace_dir: []const u8,
     model_name: []const u8,
     tools: []const Tool,
+    capabilities_section: ?[]const u8 = null,
 };
+
+/// Build a lightweight fingerprint for workspace prompt files.
+/// Used to detect when AGENTS/SOUL/etc changed and system prompt must be rebuilt.
+pub fn workspacePromptFingerprint(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+) !u64 {
+    var hasher = std.hash.Fnv1a_64.init();
+    const tracked_files = [_][]const u8{
+        "AGENTS.md",
+        "SOUL.md",
+        "TOOLS.md",
+        "IDENTITY.md",
+        "USER.md",
+        "HEARTBEAT.md",
+        "BOOTSTRAP.md",
+        "MEMORY.md",
+        "memory.md",
+    };
+
+    for (tracked_files) |filename| {
+        hasher.update(filename);
+        hasher.update("\n");
+
+        const path = try std.fs.path.join(allocator, &.{ workspace_dir, filename });
+        defer allocator.free(path);
+
+        const maybe_file = std.fs.openFileAbsolute(path, .{}) catch |err| blk: {
+            switch (err) {
+                error.FileNotFound => hasher.update("missing"),
+                else => hasher.update("open_err"),
+            }
+            break :blk null;
+        };
+        if (maybe_file == null) continue;
+
+        const file = maybe_file.?;
+        defer file.close();
+
+        const stat = file.stat() catch {
+            hasher.update("stat_err");
+            continue;
+        };
+        hasher.update("present");
+
+        const mtime_ns: i128 = stat.mtime;
+        const size_bytes: u64 = @intCast(stat.size);
+        hasher.update(std.mem.asBytes(&mtime_ns));
+        hasher.update(std.mem.asBytes(&size_bytes));
+    }
+
+    return hasher.final();
+}
 
 /// Build the full system prompt from workspace identity files, tools, and runtime context.
 pub fn buildSystemPrompt(
@@ -33,6 +87,13 @@ pub fn buildSystemPrompt(
     // Tools section
     try buildToolsSection(w, ctx.tools);
 
+    // Attachment marker conventions for channel delivery.
+    try appendChannelAttachmentsSection(w);
+
+    if (ctx.capabilities_section) |section| {
+        try w.writeAll(section);
+    }
+
     // Safety section
     try w.writeAll("## Safety\n\n");
     try w.writeAll("- Do not exfiltrate private data.\n");
@@ -40,6 +101,7 @@ pub fn buildSystemPrompt(
     try w.writeAll("- Do not bypass oversight or approval mechanisms.\n");
     try w.writeAll("- Prefer `trash` over `rm`.\n");
     try w.writeAll("- When in doubt, ask before acting externally.\n\n");
+    try w.writeAll("- Never expose internal memory implementation keys (for example: `autosave_*`, `last_hygiene_at`) in user-facing replies.\n\n");
 
     // Skills section
     try appendSkillsSection(allocator, w, ctx.workspace_dir);
@@ -75,12 +137,14 @@ fn buildIdentitySection(
         "USER.md",
         "HEARTBEAT.md",
         "BOOTSTRAP.md",
-        "MEMORY.md",
     };
 
     for (identity_files) |filename| {
         try injectWorkspaceFile(allocator, w, workspace_dir, filename);
     }
+
+    // Inject MEMORY.md if present, otherwise fallback to memory.md.
+    try injectPreferredMemoryFile(allocator, w, workspace_dir);
 }
 
 fn buildToolsSection(w: anytype, tools: []const Tool) !void {
@@ -93,6 +157,15 @@ fn buildToolsSection(w: anytype, tools: []const Tool) !void {
         });
     }
     try w.writeAll("\n");
+}
+
+fn appendChannelAttachmentsSection(w: anytype) !void {
+    try w.writeAll("## Channel Attachments\n\n");
+    try w.writeAll("- On marker-aware channels (for example Telegram), you can send real attachments by emitting markers in your final reply.\n");
+    try w.writeAll("- File/document: `[FILE:/absolute/path/to/file.ext]` or `[DOCUMENT:/absolute/path/to/file.ext]`\n");
+    try w.writeAll("- Image/video/audio/voice: `[IMAGE:/abs/path]`, `[VIDEO:/abs/path]`, `[AUDIO:/abs/path]`, `[VOICE:/abs/path]`\n");
+    try w.writeAll("- If user gives `~/...`, expand it to the absolute home path before sending.\n");
+    try w.writeAll("- Do not claim attachment sending is unavailable when these markers are supported.\n\n");
 }
 
 /// Append available skills with progressive loading.
@@ -238,6 +311,32 @@ fn injectWorkspaceFile(
     }
 }
 
+fn injectPreferredMemoryFile(
+    allocator: std.mem.Allocator,
+    w: anytype,
+    workspace_dir: []const u8,
+) !void {
+    if (workspaceFileExists(allocator, workspace_dir, "MEMORY.md")) {
+        try injectWorkspaceFile(allocator, w, workspace_dir, "MEMORY.md");
+        return;
+    }
+    if (workspaceFileExists(allocator, workspace_dir, "memory.md")) {
+        try injectWorkspaceFile(allocator, w, workspace_dir, "memory.md");
+    }
+}
+
+fn workspaceFileExists(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    filename: []const u8,
+) bool {
+    const path = std.fs.path.join(allocator, &.{ workspace_dir, filename }) catch return false;
+    defer allocator.free(path);
+    const file = std.fs.openFileAbsolute(path, .{}) catch return false;
+    file.close();
+    return true;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
@@ -270,6 +369,130 @@ test "buildSystemPrompt includes workspace dir" {
     defer allocator.free(prompt);
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "/my/workspace") != null);
+}
+
+test "buildSystemPrompt includes channel attachment marker guidance" {
+    const allocator = std.testing.allocator;
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/my/workspace",
+        .model_name = "claude",
+        .tools = &.{},
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "## Channel Attachments") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[FILE:/absolute/path/to/file.ext]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not claim attachment sending is unavailable") != null);
+}
+
+test "buildSystemPrompt injects memory.md when MEMORY.md is absent" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("memory.md", .{});
+        defer f.close();
+        try f.writeAll("alt-memory");
+    }
+
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    const prompt = try buildSystemPrompt(std.testing.allocator, .{
+        .workspace_dir = workspace,
+        .model_name = "test-model",
+        .tools = &.{},
+    });
+    defer std.testing.allocator.free(prompt);
+
+    const has_memory_header = std.mem.indexOf(u8, prompt, "### memory.md") != null or
+        std.mem.indexOf(u8, prompt, "### MEMORY.md") != null;
+    try std.testing.expect(has_memory_header);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "alt-memory") != null);
+}
+
+test "workspacePromptFingerprint is stable when files are unchanged" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("SOUL.md", .{});
+        defer f.close();
+        try f.writeAll("soul-v1");
+    }
+
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    const fp1 = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const fp2 = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    try std.testing.expectEqual(fp1, fp2);
+}
+
+test "workspacePromptFingerprint changes when tracked file changes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("SOUL.md", .{});
+        defer f.close();
+        try f.writeAll("short");
+    }
+
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace);
+
+    {
+        const f = try tmp.dir.createFile("SOUL.md", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("longer-content-after-change");
+    }
+
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    try std.testing.expect(before != after);
+}
+
+test "buildSystemPrompt prefers MEMORY.md over memory.md" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const primary = try tmp.dir.createFile("MEMORY.md", .{});
+        defer primary.close();
+        try primary.writeAll("primary-memory");
+    }
+
+    var has_distinct_case_files = true;
+    const alt = tmp.dir.createFile("memory.md", .{ .exclusive = true }) catch |err| switch (err) {
+        error.PathAlreadyExists => blk: {
+            has_distinct_case_files = false;
+            break :blk null;
+        },
+        else => return err,
+    };
+    if (alt) |f| {
+        defer f.close();
+        try f.writeAll("alt-memory");
+    }
+
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    const prompt = try buildSystemPrompt(std.testing.allocator, .{
+        .workspace_dir = workspace,
+        .model_name = "test-model",
+        .tools = &.{},
+    });
+    defer std.testing.allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "### MEMORY.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "primary-memory") != null);
+    if (has_distinct_case_files) {
+        try std.testing.expect(std.mem.indexOf(u8, prompt, "alt-memory") == null);
+        try std.testing.expect(std.mem.indexOf(u8, prompt, "### memory.md") == null);
+    }
 }
 
 test "appendDateTimeSection outputs UTC timestamp" {

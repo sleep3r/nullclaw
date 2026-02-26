@@ -4,6 +4,7 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed;
+const UNAVAILABLE_WORKSPACE_SENTINEL = "/__nullclaw_workspace_unavailable__";
 
 /// Git operations tool for structured repository management.
 pub const GitTool = struct {
@@ -116,8 +117,6 @@ pub const GitTool = struct {
         const effective_cwd = if (root.getString(args, "cwd")) |cwd| blk: {
             if (cwd.len == 0 or !std.fs.path.isAbsolute(cwd))
                 return ToolResult.fail("cwd must be an absolute path");
-            if (self.allowed_paths.len == 0)
-                return ToolResult.fail("cwd not allowed (no allowed_paths configured)");
             const resolved_cwd = std.fs.cwd().realpathAlloc(allocator, cwd) catch |err| {
                 const err_msg = try std.fmt.allocPrint(allocator, "Failed to resolve cwd: {}", .{err});
                 return ToolResult{ .success = false, .output = "", .error_msg = err_msg };
@@ -125,7 +124,9 @@ pub const GitTool = struct {
             defer allocator.free(resolved_cwd);
             const ws_resolved: ?[]const u8 = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch null;
             defer if (ws_resolved) |wr| allocator.free(wr);
-            if (!isResolvedPathAllowed(allocator, resolved_cwd, ws_resolved orelse "", self.allowed_paths))
+            if (ws_resolved == null and self.allowed_paths.len == 0)
+                return ToolResult.fail("cwd not allowed (workspace unavailable and no allowed_paths configured)");
+            if (!isResolvedPathAllowed(allocator, resolved_cwd, ws_resolved orelse UNAVAILABLE_WORKSPACE_SENTINEL, self.allowed_paths))
                 return ToolResult.fail("cwd is outside allowed areas");
             break :blk cwd;
         } else self.workspace_dir;
@@ -367,6 +368,50 @@ test "git rejects unknown operation" {
     defer if (result.error_msg) |e| std.testing.allocator.free(e);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Unknown operation") != null);
+}
+
+test "git cwd inside workspace works without allowed_paths" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"operation\":\"unknown_op\",\"cwd\":{f}}}", .{std.json.fmt(ws_path, .{})});
+    defer std.testing.allocator.free(args);
+
+    var gt = GitTool{ .workspace_dir = ws_path };
+    const t = gt.tool();
+    const parsed = try root.parseTestArgs(args);
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Unknown operation") != null);
+}
+
+test "git cwd outside workspace without allowed_paths is rejected" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.makeDir("ws");
+    try tmp_dir.dir.makeDir("other");
+
+    const root_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+    const ws_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "ws" });
+    defer std.testing.allocator.free(ws_path);
+    const other_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "other" });
+    defer std.testing.allocator.free(other_path);
+
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"operation\":\"status\",\"cwd\":{f}}}", .{std.json.fmt(other_path, .{})});
+    defer std.testing.allocator.free(args);
+
+    var gt = GitTool{ .workspace_dir = ws_path };
+    const t = gt.tool();
+    const parsed = try root.parseTestArgs(args);
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "outside allowed areas") != null);
 }
 
 test "git checkout blocks injection" {

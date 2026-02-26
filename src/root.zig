@@ -21,12 +21,15 @@ pub const state = @import("state.zig");
 pub const status = @import("status.zig");
 pub const onboard = @import("onboard.zig");
 pub const doctor = @import("doctor.zig");
+pub const capabilities = @import("capabilities.zig");
+pub const config_mutator = @import("config_mutator.zig");
 pub const service = @import("service.zig");
 pub const daemon = @import("daemon.zig");
 pub const channel_loop = @import("channel_loop.zig");
 pub const channel_manager = @import("channel_manager.zig");
 pub const channel_catalog = @import("channel_catalog.zig");
 pub const migration = @import("migration.zig");
+pub const sse_client = @import("sse_client.zig");
 pub const update = @import("update.zig");
 
 // Phase 2: Agent core

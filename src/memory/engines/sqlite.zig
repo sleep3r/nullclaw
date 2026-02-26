@@ -10,16 +10,18 @@
 //! - KV store for settings
 
 const std = @import("std");
-const root = @import("root.zig");
+const root = @import("../root.zig");
 const Memory = root.Memory;
 const MemoryCategory = root.MemoryCategory;
 const MemoryEntry = root.MemoryEntry;
+const log = std.log.scoped(.memory_sqlite);
 
 pub const c = @cImport({
     @cInclude("sqlite3.h");
 });
 
 pub const SQLITE_STATIC: c.sqlite3_destructor_type = null;
+const BUSY_TIMEOUT_MS: c_int = 5000;
 
 pub const SqliteMemory = struct {
     db: ?*c.sqlite3,
@@ -34,6 +36,10 @@ pub const SqliteMemory = struct {
         if (rc != c.SQLITE_OK) {
             if (db) |d| _ = c.sqlite3_close(d);
             return error.SqliteOpenFailed;
+        }
+        if (db) |d| {
+            // Reduce startup flakiness when multiple runtimes touch the same DB.
+            _ = c.sqlite3_busy_timeout(d, BUSY_TIMEOUT_MS);
         }
 
         var self_ = Self{ .db = db, .allocator = allocator };
@@ -50,18 +56,35 @@ pub const SqliteMemory = struct {
         }
     }
 
+    fn logExecFailure(self: *Self, context: []const u8, sql: []const u8, rc: c_int, err_msg: [*c]u8) void {
+        if (err_msg) |msg| {
+            const msg_text = std.mem.span(msg);
+            log.warn("sqlite {s} failed (rc={d}, sql={s}): {s}", .{ context, rc, sql, msg_text });
+            return;
+        }
+        if (self.db) |db| {
+            const msg_text = std.mem.span(c.sqlite3_errmsg(db));
+            log.warn("sqlite {s} failed (rc={d}, sql={s}): {s}", .{ context, rc, sql, msg_text });
+            return;
+        }
+        log.warn("sqlite {s} failed (rc={d}, sql={s})", .{ context, rc, sql });
+    }
+
     fn configurePragmas(self: *Self) !void {
-        const pragmas =
-            \\PRAGMA journal_mode = WAL;
-            \\PRAGMA synchronous  = NORMAL;
-            \\PRAGMA temp_store   = MEMORY;
-            \\PRAGMA cache_size   = -2000;
-        ;
-        var err_msg: [*c]u8 = null;
-        const rc = c.sqlite3_exec(self.db, pragmas, null, null, &err_msg);
-        if (rc != c.SQLITE_OK) {
+        // Pragmas are tuning knobs; failure should not prevent startup.
+        const pragmas = [_][:0]const u8{
+            "PRAGMA journal_mode = WAL;",
+            "PRAGMA synchronous  = NORMAL;",
+            "PRAGMA temp_store   = MEMORY;",
+            "PRAGMA cache_size   = -2000;",
+        };
+        for (pragmas) |pragma| {
+            var err_msg: [*c]u8 = null;
+            const rc = c.sqlite3_exec(self.db, pragma, null, null, &err_msg);
+            if (rc != c.SQLITE_OK) {
+                self.logExecFailure("pragma", pragma, rc, err_msg);
+            }
             if (err_msg) |msg| c.sqlite3_free(msg);
-            return error.MigrationFailed;
         }
     }
 
@@ -140,6 +163,7 @@ pub const SqliteMemory = struct {
         var err_msg: [*c]u8 = null;
         const rc = c.sqlite3_exec(self.db, sql, null, null, &err_msg);
         if (rc != c.SQLITE_OK) {
+            self.logExecFailure("schema migration", "CREATE TABLE/FTS/triggers", rc, err_msg);
             if (err_msg) |msg| c.sqlite3_free(msg);
             return error.MigrationFailed;
         }
@@ -157,7 +181,15 @@ pub const SqliteMemory = struct {
             &err_msg,
         );
         if (rc != c.SQLITE_OK) {
-            // "duplicate column name" is expected on databases that already have the column
+            // "duplicate column name" is expected on databases that already have the column.
+            var ignore_error = false;
+            if (err_msg) |msg| {
+                const msg_text = std.mem.span(msg);
+                ignore_error = std.mem.indexOf(u8, msg_text, "duplicate column name") != null;
+            }
+            if (!ignore_error) {
+                self.logExecFailure("session_id migration", "ALTER TABLE memories ADD COLUMN session_id TEXT", rc, err_msg);
+            }
             if (err_msg) |msg| c.sqlite3_free(msg);
         }
         // Ensure index exists regardless
@@ -170,6 +202,7 @@ pub const SqliteMemory = struct {
             &err_msg2,
         );
         if (rc2 != c.SQLITE_OK) {
+            self.logExecFailure("session_id migration", "CREATE INDEX IF NOT EXISTS idx_memories_session", rc2, err_msg2);
             if (err_msg2) |msg| c.sqlite3_free(msg);
         }
     }
@@ -395,10 +428,7 @@ pub const SqliteMemory = struct {
     }
 
     /// A single persisted message entry (role + content).
-    pub const MessageEntry = struct {
-        role: []const u8,
-        content: []const u8,
-    };
+    pub const MessageEntry = root.MessageEntry;
 
     /// Load all messages for a session, ordered by creation time.
     /// Caller owns the returned slice and all strings within it.
@@ -467,6 +497,39 @@ pub const SqliteMemory = struct {
         }
 
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.StepFailed;
+    }
+
+    // ── SessionStore vtable ────────────────────────────────────────
+
+    fn implSessionSaveMessage(ptr: *anyopaque, session_id: []const u8, role: []const u8, content: []const u8) anyerror!void {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return self_.saveMessage(session_id, role, content);
+    }
+
+    fn implSessionLoadMessages(ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8) anyerror![]root.MessageEntry {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return self_.loadMessages(allocator, session_id);
+    }
+
+    fn implSessionClearMessages(ptr: *anyopaque, session_id: []const u8) anyerror!void {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return self_.clearMessages(session_id);
+    }
+
+    fn implSessionClearAutoSaved(ptr: *anyopaque, session_id: ?[]const u8) anyerror!void {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return self_.clearAutoSaved(session_id);
+    }
+
+    const session_vtable = root.SessionStore.VTable{
+        .saveMessage = &implSessionSaveMessage,
+        .loadMessages = &implSessionLoadMessages,
+        .clearMessages = &implSessionClearMessages,
+        .clearAutoSaved = &implSessionClearAutoSaved,
+    };
+
+    pub fn sessionStore(self: *Self) root.SessionStore {
+        return .{ .ptr = @ptrCast(self), .vtable = &session_vtable };
     }
 
     pub fn reindex(self: *Self) !void {
@@ -576,9 +639,9 @@ pub const SqliteMemory = struct {
             if (i > 0) try sql_buf.appendSlice(allocator, " OR ");
             try sql_buf.appendSlice(allocator, "(content LIKE ?");
             try appendInt(&sql_buf, allocator, i * 2 + 1);
-            try sql_buf.appendSlice(allocator, " OR key LIKE ?");
+            try sql_buf.appendSlice(allocator, " ESCAPE '\\' OR key LIKE ?");
             try appendInt(&sql_buf, allocator, i * 2 + 2);
-            try sql_buf.appendSlice(allocator, ")");
+            try sql_buf.appendSlice(allocator, " ESCAPE '\\')");
         }
 
         try sql_buf.appendSlice(allocator, " ORDER BY updated_at DESC LIMIT ?");
@@ -597,7 +660,7 @@ pub const SqliteMemory = struct {
         }
 
         for (keywords.items, 0..) |word, i| {
-            const like = try std.fmt.allocPrint(allocator, "%{s}%", .{word});
+            const like = try escapeLikePattern(allocator, word);
             try like_bufs.append(allocator, like);
             _ = c.sqlite3_bind_text(stmt, @intCast(i * 2 + 1), like.ptr, @intCast(like.len), SQLITE_STATIC);
             _ = c.sqlite3_bind_text(stmt, @intCast(i * 2 + 2), like.ptr, @intCast(like.len), SQLITE_STATIC);
@@ -643,6 +706,7 @@ pub const SqliteMemory = struct {
         const content = try dupeColumnText(stmt, 2, allocator);
         errdefer allocator.free(content);
         const cat_str = try dupeColumnText(stmt, 3, allocator);
+        errdefer allocator.free(cat_str);
         const timestamp = try dupeColumnText(stmt, 4, allocator);
         errdefer allocator.free(timestamp);
         const sid = try dupeColumnTextNullable(stmt, session_col, allocator);
@@ -698,6 +762,22 @@ pub const SqliteMemory = struct {
         return try allocator.dupe(u8, slice);
     }
 
+    /// Escape SQL LIKE wildcards (% and _) in user input, then wrap with %...%.
+    /// Uses backslash as escape char (paired with ESCAPE '\' in the query).
+    fn escapeLikePattern(allocator: std.mem.Allocator, word: []const u8) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        try buf.append(allocator, '%');
+        for (word) |ch| {
+            if (ch == '%' or ch == '_' or ch == '\\') {
+                try buf.append(allocator, '\\');
+            }
+            try buf.append(allocator, ch);
+        }
+        try buf.append(allocator, '%');
+        return buf.toOwnedSlice(allocator);
+    }
+
     fn appendInt(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, value: usize) !void {
         var tmp: [20]u8 = undefined;
         const s = std.fmt.bufPrint(&tmp, "{d}", .{value}) catch return error.PrepareFailed;
@@ -725,6 +805,21 @@ test "sqlite memory init with in-memory db" {
     var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
     defer mem.deinit();
     try mem.saveMessage("test-session", "user", "hello");
+}
+
+test "sqlite init configures busy timeout" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    const prep_rc = c.sqlite3_prepare_v2(mem.db, "PRAGMA busy_timeout;", -1, &stmt, null);
+    try std.testing.expectEqual(@as(c_int, c.SQLITE_OK), prep_rc);
+    defer _ = c.sqlite3_finalize(stmt);
+
+    const step_rc = c.sqlite3_step(stmt);
+    try std.testing.expectEqual(@as(c_int, c.SQLITE_ROW), step_rc);
+    const timeout_ms = c.sqlite3_column_int(stmt, 0);
+    try std.testing.expect(timeout_ms >= BUSY_TIMEOUT_MS);
 }
 
 test "sqlite name" {
@@ -1584,4 +1679,259 @@ test "sqlite clearAutoSaved no-op on empty" {
     try mem.clearAutoSaved(null);
     const m = mem.memory();
     try std.testing.expectEqual(@as(usize, 0), try m.count());
+}
+
+// ── SessionStore vtable tests ─────────────────────────────────────
+
+test "sqlite sessionStore returns valid vtable" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    const store = mem.sessionStore();
+    try std.testing.expect(store.vtable == &SqliteMemory.session_vtable);
+}
+
+test "sqlite sessionStore saveMessage + loadMessages roundtrip" {
+    const allocator = std.testing.allocator;
+    var mem = try SqliteMemory.init(allocator, ":memory:");
+    defer mem.deinit();
+
+    const store = mem.sessionStore();
+    try store.saveMessage("s1", "user", "hello");
+    try store.saveMessage("s1", "assistant", "hi there");
+
+    const msgs = try store.loadMessages(allocator, "s1");
+    defer root.freeMessages(allocator, msgs);
+
+    try std.testing.expectEqual(@as(usize, 2), msgs.len);
+    try std.testing.expectEqualStrings("user", msgs[0].role);
+    try std.testing.expectEqualStrings("hello", msgs[0].content);
+    try std.testing.expectEqualStrings("assistant", msgs[1].role);
+    try std.testing.expectEqualStrings("hi there", msgs[1].content);
+}
+
+test "sqlite sessionStore clearMessages" {
+    const allocator = std.testing.allocator;
+    var mem = try SqliteMemory.init(allocator, ":memory:");
+    defer mem.deinit();
+
+    const store = mem.sessionStore();
+    try store.saveMessage("s1", "user", "hello");
+    try store.clearMessages("s1");
+
+    const msgs = try store.loadMessages(allocator, "s1");
+    defer allocator.free(msgs);
+    try std.testing.expectEqual(@as(usize, 0), msgs.len);
+}
+
+test "sqlite sessionStore clearAutoSaved" {
+    const allocator = std.testing.allocator;
+    var mem = try SqliteMemory.init(allocator, ":memory:");
+    defer mem.deinit();
+
+    const m = mem.memory();
+    try m.store("autosave_user_1", "auto data", .core, "s1");
+    try m.store("normal_key", "normal data", .core, null);
+
+    const store = mem.sessionStore();
+    try store.clearAutoSaved("s1");
+
+    // autosave entry should be gone
+    const entry = try m.get(allocator, "autosave_user_1");
+    try std.testing.expect(entry == null);
+
+    // normal entry should remain
+    const normal = try m.get(allocator, "normal_key");
+    try std.testing.expect(normal != null);
+    var e = normal.?;
+    defer e.deinit(allocator);
+}
+
+// ── R3 additional tests ───────────────────────────────────────────
+
+test "sqlite recall with SQL LIKE wildcard percent in content" {
+    // Verify that % in search query does not match everything
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("k1", "100% safe data", .core, null);
+    try m.store("k2", "completely unrelated", .core, null);
+
+    // Searching for "%" should NOT match "completely unrelated"
+    // because % is escaped in LIKE patterns
+    const results = try m.recall(std.testing.allocator, "%", 10, null);
+    defer root.freeEntries(std.testing.allocator, results);
+
+    // FTS5 may or may not match "%" — but LIKE fallback must not wildcard-match everything.
+    // If FTS5 returns 0 results (likely for single %), the LIKE search must be precise.
+    for (results) |entry| {
+        // Every returned result must actually contain "%" in key or content
+        const has_pct = std.mem.indexOf(u8, entry.content, "%") != null or
+            std.mem.indexOf(u8, entry.key, "%") != null;
+        try std.testing.expect(has_pct);
+    }
+}
+
+test "sqlite recall with SQL LIKE wildcard underscore in content" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("k1", "test_value", .core, null);
+    try m.store("k2", "testXvalue", .core, null);
+
+    // Searching for "_" should not match "testXvalue" via LIKE _
+    // (underscore matches single char in unescaped LIKE)
+    const results = try m.recall(std.testing.allocator, "_", 10, null);
+    defer root.freeEntries(std.testing.allocator, results);
+
+    for (results) |entry| {
+        const has_underscore = std.mem.indexOf(u8, entry.content, "_") != null or
+            std.mem.indexOf(u8, entry.key, "_") != null;
+        try std.testing.expect(has_underscore);
+    }
+}
+
+test "sqlite escapeLikePattern escapes wildcards" {
+    const alloc = std.testing.allocator;
+
+    // Normal word — just wrapped with %
+    {
+        const result = try SqliteMemory.escapeLikePattern(alloc, "hello");
+        defer alloc.free(result);
+        try std.testing.expectEqualStrings("%hello%", result);
+    }
+
+    // Percent sign — escaped
+    {
+        const result = try SqliteMemory.escapeLikePattern(alloc, "100%");
+        defer alloc.free(result);
+        try std.testing.expectEqualStrings("%100\\%%", result);
+    }
+
+    // Underscore — escaped
+    {
+        const result = try SqliteMemory.escapeLikePattern(alloc, "test_value");
+        defer alloc.free(result);
+        try std.testing.expectEqualStrings("%test\\_value%", result);
+    }
+
+    // Backslash — escaped
+    {
+        const result = try SqliteMemory.escapeLikePattern(alloc, "path\\to");
+        defer alloc.free(result);
+        try std.testing.expectEqualStrings("%path\\\\to%", result);
+    }
+
+    // Empty string
+    {
+        const result = try SqliteMemory.escapeLikePattern(alloc, "");
+        defer alloc.free(result);
+        try std.testing.expectEqualStrings("%%", result);
+    }
+}
+
+test "sqlite store and get with special chars in key" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    const key = "key with \"quotes\" and 'apostrophes' and %wildcards%";
+    try m.store(key, "content", .core, null);
+
+    const entry = (try m.get(std.testing.allocator, key)).?;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(key, entry.key);
+}
+
+test "sqlite store newlines in content roundtrip" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    const content = "line1\nline2\ttab\r\nwindows\n\ndouble newline";
+    try m.store("nl", content, .core, null);
+
+    const entry = (try m.get(std.testing.allocator, "nl")).?;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(content, entry.content);
+}
+
+test "sqlite upsert updates session_id from null to value" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("k", "v", .core, null);
+    {
+        const entry = (try m.get(std.testing.allocator, "k")).?;
+        defer entry.deinit(std.testing.allocator);
+        try std.testing.expect(entry.session_id == null);
+    }
+
+    try m.store("k", "v2", .core, "sess-new");
+    {
+        const entry = (try m.get(std.testing.allocator, "k")).?;
+        defer entry.deinit(std.testing.allocator);
+        try std.testing.expect(entry.session_id != null);
+        try std.testing.expectEqualStrings("sess-new", entry.session_id.?);
+    }
+}
+
+test "sqlite upsert updates session_id from value to null" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("k", "v", .core, "sess-old");
+    try m.store("k", "v2", .core, null);
+
+    const entry = (try m.get(std.testing.allocator, "k")).?;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expect(entry.session_id == null);
+}
+
+test "sqlite loadMessages empty session" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    const msgs = try mem.loadMessages(std.testing.allocator, "nonexistent");
+    defer std.testing.allocator.free(msgs);
+    try std.testing.expectEqual(@as(usize, 0), msgs.len);
+}
+
+test "sqlite loadMessages preserves order" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    try mem.saveMessage("s1", "user", "first");
+    try mem.saveMessage("s1", "assistant", "second");
+    try mem.saveMessage("s1", "user", "third");
+
+    const msgs = try mem.loadMessages(std.testing.allocator, "s1");
+    defer root.freeMessages(std.testing.allocator, msgs);
+
+    try std.testing.expectEqual(@as(usize, 3), msgs.len);
+    try std.testing.expectEqualStrings("first", msgs[0].content);
+    try std.testing.expectEqualStrings("second", msgs[1].content);
+    try std.testing.expectEqualStrings("third", msgs[2].content);
+}
+
+test "sqlite clearMessages does not affect other sessions" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    try mem.saveMessage("s1", "user", "s1 msg");
+    try mem.saveMessage("s2", "user", "s2 msg");
+
+    try mem.clearMessages("s1");
+
+    const s1_msgs = try mem.loadMessages(std.testing.allocator, "s1");
+    defer std.testing.allocator.free(s1_msgs);
+    try std.testing.expectEqual(@as(usize, 0), s1_msgs.len);
+
+    const s2_msgs = try mem.loadMessages(std.testing.allocator, "s2");
+    defer root.freeMessages(std.testing.allocator, s2_msgs);
+    try std.testing.expectEqual(@as(usize, 1), s2_msgs.len);
 }

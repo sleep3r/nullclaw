@@ -15,8 +15,10 @@ const Memory = memory_mod.Memory;
 const observability = @import("../observability.zig");
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
+const subagent_mod = @import("../subagent.zig");
 const cli_mod = @import("../channels/cli.zig");
 const security = @import("../security/policy.zig");
+const onboard = @import("../onboard.zig");
 
 const Agent = @import("root.zig").Agent;
 
@@ -43,6 +45,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         Config.printValidationError(err);
         return;
     };
+
+    // Ensure lifecycle parity: seed workspace files on first agent run
+    // so prompts always have the expected bootstrap context.
+    try onboard.scaffoldWorkspace(allocator, cfg.workspace_dir, &onboard.ProjectContext{});
 
     var out_buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&out_buf);
@@ -107,6 +113,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     defer runtime_provider.deinit();
     const resolved_api_key = runtime_provider.primaryApiKey();
 
+    var subagent_manager = subagent_mod.SubagentManager.init(allocator, &cfg, null, .{});
+    defer subagent_manager.deinit();
+
     // Create tools (with agents config for delegate depth enforcement)
     const tools = try tools_mod.allTools(allocator, cfg.workspace_dir, .{
         .http_enabled = cfg.http_request.enabled,
@@ -117,20 +126,22 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .tools_config = cfg.tools,
         .allowed_paths = cfg.autonomy.allowed_paths,
         .policy = &policy,
+        .subagent_manager = &subagent_manager,
     });
     defer tools_mod.deinitTools(allocator, tools);
 
     // Create memory (optional — don't fail if it can't init)
-    var mem_opt: ?Memory = null;
-    const db_path = try std.fs.path.joinZ(allocator, &.{ cfg.workspace_dir, "memory.db" });
-    defer allocator.free(db_path);
-    if (memory_mod.createMemory(allocator, cfg.memory.backend, db_path)) |mem| {
-        mem_opt = mem;
-    } else |_| {}
-    defer if (mem_opt) |m| m.deinit();
+    var mem_rt = memory_mod.initRuntime(allocator, &cfg.memory, cfg.workspace_dir);
+    defer if (mem_rt) |*rt| rt.deinit();
+    const mem_opt: ?Memory = if (mem_rt) |rt| rt.memory else null;
 
     // Bind memory backend once for this tool set before creating agents.
     tools_mod.bindMemoryTools(tools, mem_opt);
+
+    // Bind MemoryRuntime to memory tools for hybrid search and vector sync.
+    if (mem_rt) |*rt| {
+        tools_mod.bindMemoryRuntime(tools, rt);
+    }
 
     // Provider interface from runtime bundle (includes retries/fallbacks).
     const provider_i: Provider = runtime_provider.provider();
@@ -147,6 +158,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
         var agent = try Agent.fromConfig(allocator, &cfg, provider_i, tools, mem_opt, obs);
         agent.policy = &policy;
+        agent.session_store = if (mem_rt) |rt| rt.session_store else null;
+        agent.response_cache = if (mem_rt) |*rt| rt.response_cache else null;
+        agent.mem_rt = if (mem_rt) |*rt| rt else null;
         if (session_id) |sid| {
             agent.memory_session_id = sid;
         }
@@ -228,6 +242,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     var agent = try Agent.fromConfig(allocator, &cfg, provider_i, tools, mem_opt, obs);
     agent.policy = &policy;
+    agent.session_store = if (mem_rt) |rt| rt.session_store else null;
+    agent.response_cache = if (mem_rt) |*rt| rt.response_cache else null;
+    agent.mem_rt = if (mem_rt) |*rt| rt else null;
     if (session_id) |sid| {
         agent.memory_session_id = sid;
     }

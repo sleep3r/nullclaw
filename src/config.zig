@@ -120,7 +120,7 @@ pub const Config = struct {
     // These are set during load() to mirror nested values.
     temperature: f64 = 0.7,
     max_tokens: ?u32 = null,
-    memory_backend: []const u8 = "sqlite",
+    memory_backend: []const u8 = config_types.MemoryConfig.DEFAULT_MEMORY_BACKEND,
     memory_auto_save: bool = true,
     heartbeat_enabled: bool = false,
     heartbeat_interval_minutes: u32 = 30,
@@ -202,7 +202,10 @@ pub const Config = struct {
         if (std.fs.openFileAbsolute(config_path, .{})) |file| {
             defer file.close();
             const content = try file.readToEndAlloc(allocator, 1024 * 64);
-            cfg.parseJson(content) catch {};
+            cfg.parseJson(content) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {}, // malformed JSON — use defaults for unparsed fields
+            };
         } else |_| {
             // Config file doesn't exist yet — use defaults
         }
@@ -242,7 +245,33 @@ pub const Config = struct {
         }
     }
 
-    fn writeChannelAccounts(w: *std.Io.Writer, channel_name: []const u8, accounts: anytype) !void {
+    fn writeIndentedMultilineJson(w: *std.Io.Writer, json: []const u8, continuation_indent: []const u8) !void {
+        var start: usize = 0;
+        while (start < json.len) {
+            const rel_nl = std.mem.indexOfScalar(u8, json[start..], '\n');
+            if (rel_nl) |nl| {
+                const end = start + nl;
+                try w.writeAll(json[start..end]);
+                try w.writeAll("\n");
+                const next_start = end + 1;
+                if (next_start < json.len) {
+                    try w.writeAll(continuation_indent);
+                }
+                start = next_start;
+            } else {
+                try w.writeAll(json[start..]);
+                break;
+            }
+        }
+    }
+
+    fn writePrettyJsonInline(allocator: std.mem.Allocator, w: *std.Io.Writer, value: anytype, continuation_indent: []const u8) !void {
+        const pretty = try std.json.Stringify.valueAlloc(allocator, value, .{ .whitespace = .indent_2 });
+        defer allocator.free(pretty);
+        try writeIndentedMultilineJson(w, pretty, continuation_indent);
+    }
+
+    fn writeChannelAccounts(allocator: std.mem.Allocator, w: *std.Io.Writer, channel_name: []const u8, accounts: anytype) !void {
         try w.print("    \"{s}\": {{\n      \"accounts\": {{", .{channel_name});
         for (accounts, 0..) |account, i| {
             if (i == 0) {
@@ -254,7 +283,8 @@ pub const Config = struct {
                 account.account_id
             else
                 "default";
-            try w.print("        \"{s}\": {f}", .{ account_id, std.json.fmt(account, .{}) });
+            try w.print("        \"{s}\": ", .{account_id});
+            try writePrettyJsonInline(allocator, w, account, "        ");
         }
         try w.print("\n      }}\n    }}", .{});
     }
@@ -277,14 +307,15 @@ pub const Config = struct {
                 .pointer => |ptr| {
                     if (ptr.size == .slice and channel_value.len > 0) {
                         try writeChannelFieldSeparator(w, wrote_any);
-                        try writeChannelAccounts(w, field.name, channel_value);
+                        try writeChannelAccounts(self.allocator, w, field.name, channel_value);
                         wrote_any = true;
                     }
                 },
                 .optional => {
                     if (channel_value) |val| {
                         try writeChannelFieldSeparator(w, wrote_any);
-                        try w.print("    \"{s}\": {f}", .{ field.name, std.json.fmt(val, .{}) });
+                        try w.print("    \"{s}\": ", .{field.name});
+                        try writePrettyJsonInline(self.allocator, w, val, "    ");
                         wrote_any = true;
                     }
                 },
@@ -989,8 +1020,9 @@ test "save writes configured telegram channel account" {
 
     try std.testing.expect(std.mem.indexOf(u8, content, "\"telegram\": {") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"accounts\": {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "\"main\": {\"account_id\":\"main\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "\"bot_token\":\"123:ABC\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"main\": {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"account_id\": \"main\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"bot_token\": \"123:ABC\"") != null);
 }
 
 test "save roundtrip preserves reliability settings" {
@@ -1066,7 +1098,7 @@ test "save roundtrip preserves reliability settings" {
 test "json parse memory weights accept integer values" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"memory":{"vector_weight":1,"keyword_weight":0}}
+        \\{"memory":{"search":{"query":{"hybrid":{"vector_weight":1,"text_weight":0}}}}}
     ;
     var cfg = Config{
         .workspace_dir = "/tmp/yc",
@@ -1074,8 +1106,8 @@ test "json parse memory weights accept integer values" {
         .allocator = allocator,
     };
     try cfg.parseJson(json);
-    try std.testing.expectEqual(@as(f64, 1.0), cfg.memory.vector_weight);
-    try std.testing.expectEqual(@as(f64, 0.0), cfg.memory.keyword_weight);
+    try std.testing.expectEqual(@as(f64, 1.0), cfg.memory.search.query.hybrid.vector_weight);
+    try std.testing.expectEqual(@as(f64, 0.0), cfg.memory.search.query.hybrid.text_weight);
 }
 
 test "save roundtrip preserves extended config sections" {
@@ -1162,19 +1194,19 @@ test "save roundtrip preserves extended config sections" {
     cfg.agent.compaction_max_source_chars = 9000;
     cfg.agent.message_timeout_secs = 60;
 
-    cfg.memory.embedding_provider = "openai";
-    cfg.memory.embedding_model = "text-embedding-3-small";
-    cfg.memory.embedding_dimensions = 1536;
-    cfg.memory.vector_weight = 0.6;
-    cfg.memory.keyword_weight = 0.4;
-    cfg.memory.embedding_cache_size = 333;
-    cfg.memory.chunk_max_tokens = 1024;
-    cfg.memory.response_cache_enabled = true;
-    cfg.memory.response_cache_ttl_minutes = 15;
-    cfg.memory.response_cache_max_entries = 123;
-    cfg.memory.snapshot_enabled = true;
-    cfg.memory.snapshot_on_hygiene = true;
-    cfg.memory.auto_hydrate = false;
+    cfg.memory.search.provider = "openai";
+    cfg.memory.search.model = "text-embedding-3-small";
+    cfg.memory.search.dimensions = 1536;
+    cfg.memory.search.query.hybrid.vector_weight = 0.6;
+    cfg.memory.search.query.hybrid.text_weight = 0.4;
+    cfg.memory.search.cache.max_entries = 333;
+    cfg.memory.search.chunking.max_tokens = 1024;
+    cfg.memory.response_cache.enabled = true;
+    cfg.memory.response_cache.ttl_minutes = 15;
+    cfg.memory.response_cache.max_entries = 123;
+    cfg.memory.lifecycle.snapshot_enabled = true;
+    cfg.memory.lifecycle.snapshot_on_hygiene = true;
+    cfg.memory.lifecycle.auto_hydrate = false;
 
     cfg.gateway.allow_public_bind = true;
     cfg.gateway.pair_rate_limit_per_minute = 20;
@@ -1272,8 +1304,8 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqual(@as(u32, 32), loaded.scheduler.max_tasks);
     try std.testing.expect(loaded.agent.parallel_tools);
 
-    try std.testing.expectEqualStrings("openai", loaded.memory.embedding_provider);
-    try std.testing.expect(loaded.memory.response_cache_enabled);
+    try std.testing.expectEqualStrings("openai", loaded.memory.search.provider);
+    try std.testing.expect(loaded.memory.response_cache.enabled);
     try std.testing.expectEqual(@as(u32, 2), loaded.gateway.paired_tokens.len);
     try std.testing.expect(loaded.gateway.allow_public_bind);
     try std.testing.expectEqualStrings("cloudflare", loaded.tunnel.provider);
@@ -1506,7 +1538,7 @@ test "json parse scheduler section" {
 test "json parse agent section" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"agent": {"compact_context": true, "max_tool_iterations": 20, "max_history_messages": 80, "parallel_tools": true, "tool_dispatcher": "xml"}}
+        \\{"agent": {"compact_context": true, "max_tool_iterations": 20, "max_history_messages": 80, "parallel_tools": true, "tool_dispatcher": "xml", "token_limit": 64000}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -1515,7 +1547,20 @@ test "json parse agent section" {
     try std.testing.expectEqual(@as(u32, 80), cfg.agent.max_history_messages);
     try std.testing.expect(cfg.agent.parallel_tools);
     try std.testing.expectEqualStrings("xml", cfg.agent.tool_dispatcher);
+    try std.testing.expectEqual(@as(u64, 64_000), cfg.agent.token_limit);
+    try std.testing.expect(cfg.agent.token_limit_explicit);
     allocator.free(cfg.agent.tool_dispatcher);
+}
+
+test "json parse agent token_limit explicit remains false when omitted" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"agent": {"max_tool_iterations": 20}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(config_types.DEFAULT_AGENT_TOKEN_LIMIT, cfg.agent.token_limit);
+    try std.testing.expect(!cfg.agent.token_limit_explicit);
 }
 
 test "json parse composio section" {
@@ -2680,7 +2725,7 @@ test "json parse reasoning_effort low" {
     allocator.free(cfg.reasoning_effort.?);
 }
 
-test "unknown openclaw fields silently ignored" {
+test "unknown foreign fields silently ignored" {
     const allocator = std.testing.allocator;
     const json =
         \\{"models": {"bedrock_discovery": true, "providers": {}}, "tts": {"enabled": true}, "session": {}, "ui": {}, "skills": []}

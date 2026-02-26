@@ -18,6 +18,7 @@ const tools_mod = @import("../tools/root.zig");
 const Tool = tools_mod.Tool;
 const memory_mod = @import("../memory/root.zig");
 const Memory = memory_mod.Memory;
+const capabilities_mod = @import("../capabilities.zig");
 const multimodal = @import("../multimodal.zig");
 const platform = @import("../platform.zig");
 const observability = @import("../observability.zig");
@@ -25,8 +26,11 @@ const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
 
+const cache = memory_mod.cache;
 pub const dispatcher = @import("dispatcher.zig");
 pub const compaction = @import("compaction.zig");
+pub const context_tokens = @import("context_tokens.zig");
+pub const max_tokens_resolver = @import("max_tokens.zig");
 pub const prompt = @import("prompt.zig");
 pub const memory_loader = @import("memory_loader.zig");
 pub const commands = @import("commands.zig");
@@ -211,23 +215,31 @@ pub const Agent = struct {
     tools: []const Tool,
     tool_specs: []const ToolSpec,
     mem: ?Memory,
+    session_store: ?memory_mod.SessionStore = null,
+    response_cache: ?*cache.ResponseCache = null,
+    /// Optional MemoryRuntime pointer for diagnostics (e.g. /doctor command).
+    mem_rt: ?*memory_mod.MemoryRuntime = null,
     /// Optional session scope for memory read/write operations.
     memory_session_id: ?[]const u8 = null,
     observer: Observer,
     model_name: []const u8,
     model_name_owned: bool = false,
     default_provider: []const u8 = "openrouter",
+    default_provider_owned: bool = false,
     default_model: []const u8 = "anthropic/claude-sonnet-4",
     configured_providers: []const config_types.ProviderEntry = &.{},
     fallback_providers: []const []const u8 = &.{},
     model_fallbacks: []const config_types.ModelFallbackEntry = &.{},
     temperature: f64,
     workspace_dir: []const u8,
+    allowed_paths: []const []const u8 = &.{},
     max_tool_iterations: u32,
     max_history_messages: u32,
     auto_save: bool,
     token_limit: u64 = 0,
-    max_tokens: ?u32 = null,
+    token_limit_override: ?u64 = null,
+    max_tokens: u32 = max_tokens_resolver.DEFAULT_MODEL_MAX_TOKENS,
+    max_tokens_override: ?u32 = null,
     reasoning_effort: ?[]const u8 = null,
     verbose_level: VerboseLevel = .off,
     reasoning_mode: ReasoningMode = .off,
@@ -279,6 +291,8 @@ pub const Agent = struct {
 
     /// Whether the system prompt has been injected.
     has_system_prompt: bool = false,
+    /// Fingerprint of workspace prompt files for the currently injected system prompt.
+    workspace_prompt_fingerprint: ?u64 = null,
 
     /// Whether compaction was performed during the last turn.
     last_turn_compacted: bool = false,
@@ -310,6 +324,11 @@ pub const Agent = struct {
         observer_i: Observer,
     ) !Agent {
         const default_model = cfg.default_model orelse return error.NoDefaultModel;
+        const token_limit_override = if (cfg.agent.token_limit_explicit) cfg.agent.token_limit else null;
+        const resolved_token_limit = context_tokens.resolveContextTokens(token_limit_override, default_model);
+        const resolved_max_tokens_raw = max_tokens_resolver.resolveMaxTokens(cfg.max_tokens, default_model);
+        const token_limit_cap: u32 = @intCast(@min(resolved_token_limit, @as(u64, std.math.maxInt(u32))));
+        const resolved_max_tokens = @min(resolved_max_tokens_raw, token_limit_cap);
 
         // Build tool specs for function-calling APIs
         const specs = try allocator.alloc(ToolSpec, tools.len);
@@ -336,11 +355,14 @@ pub const Agent = struct {
             .model_fallbacks = cfg.reliability.model_fallbacks,
             .temperature = cfg.default_temperature,
             .workspace_dir = cfg.workspace_dir,
+            .allowed_paths = cfg.autonomy.allowed_paths,
             .max_tool_iterations = cfg.agent.max_tool_iterations,
             .max_history_messages = cfg.agent.max_history_messages,
             .auto_save = cfg.memory.auto_save,
-            .token_limit = cfg.agent.token_limit,
-            .max_tokens = cfg.max_tokens,
+            .token_limit = resolved_token_limit,
+            .token_limit_override = token_limit_override,
+            .max_tokens = resolved_max_tokens,
+            .max_tokens_override = cfg.max_tokens,
             .reasoning_effort = cfg.reasoning_effort,
             .message_timeout_secs = cfg.agent.message_timeout_secs,
             .compaction_keep_recent = cfg.agent.compaction_keep_recent,
@@ -355,6 +377,7 @@ pub const Agent = struct {
 
     pub fn deinit(self: *Agent) void {
         if (self.model_name_owned) self.allocator.free(self.model_name);
+        if (self.default_provider_owned) self.allocator.free(self.default_provider);
         if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
         if (self.tts_provider_owned and self.tts_provider != null) self.allocator.free(self.tts_provider.?);
         if (self.pending_exec_command_owned and self.pending_exec_command != null) self.allocator.free(self.pending_exec_command.?);
@@ -434,6 +457,66 @@ pub const Agent = struct {
 
     fn composeFinalReply(self: *const Agent, base_text: []const u8, reasoning_content: ?[]const u8, usage: providers.TokenUsage) ![]const u8 {
         return commands.composeFinalReply(self, base_text, reasoning_content, usage);
+    }
+
+    fn shouldForceActionFollowThrough(text: []const u8) bool {
+        const ascii_patterns = [_][]const u8{
+            "i'll try",
+            "i will try",
+            "let me try",
+            "i'll check",
+            "i will check",
+            "let me check",
+            "i'll retry",
+            "i will retry",
+            "let me retry",
+            "i'll attempt",
+            "i will attempt",
+            "i'll do that now",
+            "i will do that now",
+            "doing that now",
+        };
+        inline for (ascii_patterns) |pattern| {
+            if (containsAsciiIgnoreCase(text, pattern)) return true;
+        }
+
+        const exact_patterns = [_][]const u8{
+            "сейчас попробую",
+            "Сейчас попробую",
+            "попробую снова",
+            "Попробую снова",
+            "сейчас проверю",
+            "Сейчас проверю",
+            "сейчас сделаю",
+            "Сейчас сделаю",
+            "попробую переснять",
+            "Попробую переснять",
+            "сейчас перепроверю",
+            "Сейчас перепроверю",
+            "попробую ещё раз",
+            "Попробую ещё раз",
+        };
+        inline for (exact_patterns) |pattern| {
+            if (std.mem.indexOf(u8, text, pattern) != null) return true;
+        }
+        return false;
+    }
+
+    fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+        if (needle.len == 0 or haystack.len < needle.len) return false;
+        var i: usize = 0;
+        while (i + needle.len <= haystack.len) : (i += 1) {
+            var matched = true;
+            var j: usize = 0;
+            while (j < needle.len) : (j += 1) {
+                if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) {
+                    matched = false;
+                    break;
+                }
+            }
+            if (matched) return true;
+        }
+        return false;
     }
 
     fn isExecToolName(tool_name: []const u8) bool {
@@ -546,18 +629,36 @@ pub const Agent = struct {
     /// execute tools, and loop until a final text response is produced.
     pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
         self.context_was_compacted = false;
+        commands.refreshSubagentToolContext(self);
 
         // Handle slash commands before sending to LLM (saves tokens)
         if (try self.handleSlashCommand(user_message)) |response| {
             return response;
         }
 
-        // Inject system prompt on first turn
+        // Inject system prompt on first turn (or when tracked workspace files changed).
+        const workspace_fp = prompt.workspacePromptFingerprint(self.allocator, self.workspace_dir) catch null;
+        if (self.has_system_prompt and workspace_fp != null and self.workspace_prompt_fingerprint != workspace_fp) {
+            self.has_system_prompt = false;
+        }
+
         if (!self.has_system_prompt) {
+            var cfg_for_caps_opt: ?Config = Config.load(self.allocator) catch null;
+            defer if (cfg_for_caps_opt) |*cfg_loaded| cfg_loaded.deinit();
+            const cfg_for_caps_ptr: ?*const Config = if (cfg_for_caps_opt) |*cfg_loaded| cfg_loaded else null;
+
+            const capabilities_section = capabilities_mod.buildPromptSection(
+                self.allocator,
+                cfg_for_caps_ptr,
+                self.tools,
+            ) catch null;
+            defer if (capabilities_section) |section| self.allocator.free(section);
+
             const system_prompt = try prompt.buildSystemPrompt(self.allocator, .{
                 .workspace_dir = self.workspace_dir,
                 .model_name = self.model_name,
                 .tools = self.tools,
+                .capabilities_section = capabilities_section,
             });
             defer self.allocator.free(system_prompt);
 
@@ -569,28 +670,50 @@ pub const Agent = struct {
             @memcpy(full_system[0..system_prompt.len], system_prompt);
             @memcpy(full_system[system_prompt.len..], tool_instructions);
 
-            try self.history.append(self.allocator, .{
-                .role = .system,
-                .content = full_system,
-            });
+            // Keep exactly one canonical system prompt at history[0].
+            // This allows /model to invalidate and refresh the prompt in place.
+            if (self.history.items.len > 0 and self.history.items[0].role == .system) {
+                self.history.items[0].deinit(self.allocator);
+                self.history.items[0] = .{
+                    .role = .system,
+                    .content = full_system,
+                };
+            } else if (self.history.items.len > 0) {
+                try self.history.insert(self.allocator, 0, .{
+                    .role = .system,
+                    .content = full_system,
+                });
+            } else {
+                try self.history.append(self.allocator, .{
+                    .role = .system,
+                    .content = full_system,
+                });
+            }
             self.has_system_prompt = true;
+            self.workspace_prompt_fingerprint = workspace_fp;
         }
 
-        // Auto-save user message to memory (timestamp-based key to avoid overwriting)
+        // Auto-save user message to memory (nanoTimestamp key to avoid collisions within the same second)
         if (self.auto_save) {
             if (self.mem) |mem| {
-                const ts = @as(u64, @intCast(std.time.timestamp()));
+                const ts: u128 = @bitCast(std.time.nanoTimestamp());
                 const save_key = std.fmt.allocPrint(self.allocator, "autosave_user_{d}", .{ts}) catch null;
                 if (save_key) |key| {
                     defer self.allocator.free(key);
-                    mem.store(key, user_message, .conversation, self.memory_session_id) catch {};
+                    if (mem.store(key, user_message, .conversation, self.memory_session_id)) |_| {
+                        // Vector sync after auto-save
+                        if (self.mem_rt) |rt| {
+                            rt.syncVectorAfterStore(self.allocator, key, user_message);
+                        }
+                    } else |_| {}
                 }
             }
         }
 
         // Enrich message with memory context (always returns owned slice; ownership → history)
+        // Uses retrieval pipeline (hybrid search, RRF, temporal decay, MMR) when MemoryRuntime is available.
         const enriched = if (self.mem) |mem|
-            try memory_loader.enrichMessage(self.allocator, mem, user_message, self.memory_session_id)
+            try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, user_message, self.memory_session_id)
         else
             try self.allocator.dupe(u8, user_message);
         errdefer self.allocator.free(enriched);
@@ -599,6 +722,26 @@ pub const Agent = struct {
             .role = .user,
             .content = enriched,
         });
+
+        // ── Response cache check ──
+        if (self.response_cache) |rc| {
+            var key_buf: [16]u8 = undefined;
+            const system_prompt = if (self.history.items.len > 0 and self.history.items[0].role == .system)
+                self.history.items[0].content
+            else
+                null;
+            const key_hex = cache.ResponseCache.cacheKeyHex(&key_buf, self.model_name, system_prompt, user_message);
+            if (rc.get(self.allocator, key_hex) catch null) |cached_response| {
+                errdefer self.allocator.free(cached_response);
+                const history_copy = try self.allocator.dupe(u8, cached_response);
+                errdefer self.allocator.free(history_copy);
+                try self.history.append(self.allocator, .{
+                    .role = .assistant,
+                    .content = history_copy,
+                });
+                return cached_response;
+            }
+        }
 
         // Record agent event
         const start_event = ObserverEvent{ .llm_request = .{
@@ -613,6 +756,7 @@ pub const Agent = struct {
         defer iter_arena.deinit();
 
         var iteration: u32 = 0;
+        var forced_follow_through_count: u32 = 0;
         while (iteration < self.max_tool_iterations) : (iteration += 1) {
             _ = iter_arena.reset(.retain_capacity);
             const arena = iter_arena.allocator();
@@ -830,6 +974,30 @@ pub const Agent = struct {
             const display_text = if (parsed_text.len > 0) parsed_text else response_text;
 
             if (parsed_calls.len == 0) {
+                // Guardrail: if the model promises "I'll try/check now" but emits no
+                // tool call, force one follow-up completion to either act now or
+                // explicitly state the limitation without deferred promises.
+                if (!is_streaming and
+                    forced_follow_through_count < 2 and
+                    iteration + 1 < self.max_tool_iterations and
+                    shouldForceActionFollowThrough(display_text))
+                {
+                    try self.history.append(self.allocator, .{
+                        .role = .assistant,
+                        .content = try self.allocator.dupe(u8, display_text),
+                    });
+                    try self.history.append(self.allocator, .{
+                        .role = .user,
+                        .content = try self.allocator.dupe(u8, "SYSTEM: You just promised to take action now (for example: \"I'll try/check now\"). " ++
+                            "Do it in this turn by issuing the appropriate tool call(s). " ++
+                            "If no tool can perform it, respond with a clear limitation now and do not promise another future attempt."),
+                    });
+                    self.trimHistory();
+                    self.freeResponseFields(&response);
+                    forced_follow_through_count += 1;
+                    continue;
+                }
+
                 // No tool calls — final response
                 const base_text = if (self.context_was_compacted) blk: {
                     self.context_was_compacted = false;
@@ -853,12 +1021,29 @@ pub const Agent = struct {
                 // Auto-save assistant response
                 if (self.auto_save) {
                     if (self.mem) |mem| {
-                        const summary = if (base_text.len > 100) base_text[0..100] else base_text;
-                        const ts = @as(u64, @intCast(std.time.timestamp()));
-                        const save_key = try std.fmt.allocPrint(self.allocator, "autosave_assistant_{d}", .{ts});
-                        defer self.allocator.free(save_key);
-                        mem.store(save_key, summary, .daily, self.memory_session_id) catch {};
+                        // Truncate to ~100 bytes on a valid UTF-8 boundary
+                        const summary = if (base_text.len > 100) blk: {
+                            var end: usize = 100;
+                            while (end > 0 and base_text[end] & 0xC0 == 0x80) end -= 1;
+                            break :blk base_text[0..end];
+                        } else base_text;
+                        const ts: u128 = @bitCast(std.time.nanoTimestamp());
+                        const save_key = std.fmt.allocPrint(self.allocator, "autosave_assistant_{d}", .{ts}) catch null;
+                        if (save_key) |key| {
+                            defer self.allocator.free(key);
+                            if (mem.store(key, summary, .conversation, self.memory_session_id)) |_| {
+                                // Vector sync after auto-save
+                                if (self.mem_rt) |rt| {
+                                    rt.syncVectorAfterStore(self.allocator, key, summary);
+                                }
+                            } else |_| {}
+                        }
                     }
+                }
+
+                // Drain durable outbox after turn completion (best-effort)
+                if (self.mem_rt) |rt| {
+                    _ = rt.drainOutbox(self.allocator);
                 }
 
                 const complete_event = ObserverEvent{ .turn_complete = {} };
@@ -868,6 +1053,18 @@ pub const Agent = struct {
                 // All borrows have been duped into final_text and history at this point.
                 self.freeResponseFields(&response);
                 self.allocator.free(base_text);
+
+                // ── Cache store (only for direct responses, no tool calls) ──
+                if (self.response_cache) |rc| {
+                    var store_key_buf: [16]u8 = undefined;
+                    const sys_prompt = if (self.history.items.len > 0 and self.history.items[0].role == .system)
+                        self.history.items[0].content
+                    else
+                        null;
+                    const store_key_hex = cache.ResponseCache.cacheKeyHex(&store_key_buf, self.model_name, sys_prompt, user_message);
+                    const token_count: u32 = @intCast(@min(self.last_turn_usage.total_tokens, std.math.maxInt(u32)));
+                    rc.put(self.allocator, store_key_hex, self.model_name, final_text, token_count) catch {};
+                }
 
                 return final_text;
             }
@@ -926,7 +1123,9 @@ pub const Agent = struct {
             const scrubbed_results = try providers.scrubToolOutput(arena, formatted_results);
             const with_reflection = try std.fmt.allocPrint(
                 arena,
-                "{s}\n\nReflect on the tool results above and decide your next steps.",
+                "{s}\n\nReflect on the tool results above and decide your next steps. " ++
+                    "If a tool failed due to policy/permissions, do not repeat the same blocked call; explain the limitation and choose a different available tool or ask the user for permission/config change. " ++
+                    "If a tool failed due to a transient issue (timeout/network/rate-limit), proactively retry up to 2 times with adjusted parameters before giving up.",
                 .{scrubbed_results},
             );
             try self.history.append(self.allocator, .{
@@ -1108,34 +1307,49 @@ pub const Agent = struct {
             return error.ProviderDoesNotSupportVision;
         }
 
-        // Allow reading from the platform temp dir (where Telegram photos are saved).
-        const tmp_dir = platform.getTempDir(arena) catch null;
-        const allowed: []const []const u8 = if (tmp_dir) |td| blk: {
-            const trimmed_tmp = std.mem.trimRight(u8, td, "/\\");
-            if (trimmed_tmp.len == 0) break :blk &.{};
-
-            const resolved_tmp = std.fs.realpathAlloc(arena, trimmed_tmp) catch null;
-            if (resolved_tmp) |rt| {
-                // Include both env TMPDIR and canonical realpath to handle
-                // /var vs /private/var aliases on macOS.
-                if (!std.mem.eql(u8, rt, trimmed_tmp)) {
-                    const dirs = try arena.alloc([]const u8, 2);
-                    dirs[0] = trimmed_tmp;
-                    dirs[1] = rt;
-                    break :blk dirs;
-                }
-            }
-
-            const dirs = try arena.alloc([]const u8, 1);
-            // Strip trailing separator so pathStartsWith works correctly
-            // (TMPDIR on macOS ends with '/')
-            dirs[0] = trimmed_tmp;
-            break :blk dirs;
-        } else &.{};
+        // Allow local multimodal reads from:
+        // - workspace (e.g. screenshot tool output),
+        // - autonomy.allowed_paths,
+        // - platform temp dir (e.g. Telegram downloaded files).
+        var allowed_dirs_list: std.ArrayListUnmanaged([]const u8) = .empty;
+        try appendMultimodalAllowedDir(arena, &allowed_dirs_list, self.workspace_dir);
+        for (self.allowed_paths) |dir| {
+            try appendMultimodalAllowedDir(arena, &allowed_dirs_list, dir);
+        }
+        if (platform.getTempDir(arena) catch null) |tmp_dir| {
+            try appendMultimodalAllowedDir(arena, &allowed_dirs_list, tmp_dir);
+        }
+        const allowed = try allowed_dirs_list.toOwnedSlice(arena);
 
         return multimodal.prepareMessagesForProvider(arena, m, .{
             .allowed_dirs = allowed,
         });
+    }
+
+    fn appendMultimodalAllowedDir(
+        arena: std.mem.Allocator,
+        dirs: *std.ArrayListUnmanaged([]const u8),
+        raw_dir: []const u8,
+    ) !void {
+        const trimmed = std.mem.trimRight(u8, raw_dir, "/\\");
+        if (trimmed.len == 0) return;
+
+        if (!containsMultimodalDir(dirs.items, trimmed)) {
+            try dirs.append(arena, trimmed);
+        }
+
+        // Add canonical path variant too (/var <-> /private/var on macOS).
+        const canonical = std.fs.realpathAlloc(arena, trimmed) catch return;
+        if (!containsMultimodalDir(dirs.items, canonical)) {
+            try dirs.append(arena, canonical);
+        }
+    }
+
+    fn containsMultimodalDir(dirs: []const []const u8, target: []const u8) bool {
+        for (dirs) |dir| {
+            if (std.mem.eql(u8, dir, target)) return true;
+        }
+        return false;
     }
 
     /// Build a flat ChatMessage slice from owned history.
@@ -1188,6 +1402,7 @@ pub const Agent = struct {
         }
         self.history.items.len = 0;
         self.has_system_prompt = false;
+        self.workspace_prompt_fingerprint = null;
     }
 
     /// Get total tokens used.
@@ -1341,6 +1556,7 @@ test "Agent clear history" {
         .history = .empty,
         .total_tokens = 0,
         .has_system_prompt = true,
+        .workspace_prompt_fingerprint = 1234,
     };
     defer agent.deinit();
 
@@ -1359,6 +1575,7 @@ test "Agent clear history" {
 
     try std.testing.expectEqual(@as(usize, 0), agent.historyLen());
     try std.testing.expect(!agent.has_system_prompt);
+    try std.testing.expect(agent.workspace_prompt_fingerprint == null);
 }
 
 test "dispatcher module reexport" {
@@ -1705,6 +1922,97 @@ test "Agent buildProviderMessages uses model-aware vision capability" {
     try std.testing.expect(messages[0].content_parts != null);
 }
 
+test "Agent buildProviderMessages allows workspace image paths" {
+    const DummyProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{};
+        }
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+        fn supportsVision(_: *anyopaque) bool {
+            return true;
+        }
+        fn supportsVisionForModel(_: *anyopaque, _: []const u8) bool {
+            return true;
+        }
+        fn getName(_: *anyopaque) []const u8 {
+            return "dummy";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "screen.png",
+        .data = "\x89PNG\x0d\x0a\x1a\x0a",
+    });
+
+    const allocator = std.testing.allocator;
+    const workspace_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace_path);
+    const image_path = try std.fs.path.join(allocator, &.{ workspace_path, "screen.png" });
+    defer allocator.free(image_path);
+
+    var dummy: u8 = 0;
+    const vtable = Provider.VTable{
+        .chatWithSystem = DummyProvider.chatWithSystem,
+        .chat = DummyProvider.chat,
+        .supportsNativeTools = DummyProvider.supportsNativeTools,
+        .supports_vision = DummyProvider.supportsVision,
+        .supports_vision_for_model = DummyProvider.supportsVisionForModel,
+        .getName = DummyProvider.getName,
+        .deinit = DummyProvider.deinitFn,
+    };
+    const prov = Provider{ .ptr = @ptrCast(&dummy), .vtable = &vtable };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = prov,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "vision-model",
+        .temperature = 0.7,
+        .workspace_dir = workspace_path,
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try std.fmt.allocPrint(allocator, "Inspect [IMAGE:{s}]", .{image_path}),
+    });
+
+    var arena_impl = std.heap.ArenaAllocator.init(allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const messages = try agent.buildProviderMessages(arena);
+
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expect(messages[0].content_parts != null);
+    const parts = messages[0].content_parts.?;
+    var has_image_part = false;
+    for (parts) |part| {
+        if (part == .image_base64) {
+            has_image_part = true;
+            break;
+        }
+    }
+    try std.testing.expect(has_image_part);
+}
+
 test "Agent max_tool_iterations default" {
     try std.testing.expectEqual(@as(u32, 25), DEFAULT_MAX_TOOL_ITERATIONS);
 }
@@ -1822,6 +2130,102 @@ fn find_tool_by_name(tools: []const Tool, name: []const u8) ?Tool {
     return null;
 }
 
+test "Agent.fromConfig resolves token limit from model lookup when unset" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.agent.token_limit = config_types.DEFAULT_AGENT_TOKEN_LIMIT;
+    cfg.agent.token_limit_explicit = false;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expectEqual(@as(u64, 128_000), agent.token_limit);
+    try std.testing.expect(agent.token_limit_override == null);
+    try std.testing.expectEqual(@as(u32, max_tokens_resolver.DEFAULT_MODEL_MAX_TOKENS), agent.max_tokens);
+    try std.testing.expect(agent.max_tokens_override == null);
+}
+
+test "Agent.fromConfig keeps explicit token_limit override" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.agent.token_limit = 64_000;
+    cfg.agent.token_limit_explicit = true;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expectEqual(@as(u64, 64_000), agent.token_limit);
+    try std.testing.expectEqual(@as(?u64, 64_000), agent.token_limit_override);
+}
+
+test "Agent.fromConfig resolves max_tokens from provider lookup when unset" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "qianfan/custom-model",
+        .allocator = allocator,
+    };
+    cfg.max_tokens = null;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expectEqual(@as(u32, 32_768), agent.max_tokens);
+    try std.testing.expect(agent.max_tokens_override == null);
+}
+
+test "Agent.fromConfig keeps explicit max_tokens override" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "qianfan/custom-model",
+        .allocator = allocator,
+    };
+    cfg.max_tokens = 1536;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1536), agent.max_tokens);
+    try std.testing.expectEqual(@as(?u32, 1536), agent.max_tokens_override);
+}
+
+test "Agent.fromConfig clamps max_tokens to token_limit" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.agent.token_limit = 4096;
+    cfg.agent.token_limit_explicit = true;
+    cfg.max_tokens = 8192;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expectEqual(@as(u64, 4096), agent.token_limit);
+    try std.testing.expectEqual(@as(u32, 4096), agent.max_tokens);
+}
+
 test "slash /new clears history" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
@@ -1921,24 +2325,79 @@ test "slash /model switches model" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
+    agent.max_tokens = 111;
+    agent.has_system_prompt = true;
 
     const response = (try agent.handleSlashCommand("/model gpt-4o")).?;
     defer allocator.free(response);
 
     try std.testing.expect(std.mem.indexOf(u8, response, "gpt-4o") != null);
     try std.testing.expectEqualStrings("gpt-4o", agent.model_name);
+    try std.testing.expectEqualStrings("gpt-4o", agent.default_model);
+    try std.testing.expectEqual(@as(u64, 128_000), agent.token_limit);
+    try std.testing.expectEqual(@as(u32, 8192), agent.max_tokens);
+    try std.testing.expect(!agent.has_system_prompt);
 }
 
 test "slash /model with colon switches model" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
+    agent.max_tokens = 111;
 
     const response = (try agent.handleSlashCommand("/model: gpt-4.1-mini")).?;
     defer allocator.free(response);
 
     try std.testing.expect(std.mem.indexOf(u8, response, "gpt-4.1-mini") != null);
     try std.testing.expectEqualStrings("gpt-4.1-mini", agent.model_name);
+    try std.testing.expectEqual(@as(u64, 128_000), agent.token_limit);
+    try std.testing.expectEqual(@as(u32, 8192), agent.max_tokens);
+}
+
+test "slash /model with telegram bot mention switches model" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.max_tokens = 111;
+
+    const response = (try agent.handleSlashCommand("/model@nullclaw_bot qianfan/custom-model")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "qianfan/custom-model") != null);
+    try std.testing.expectEqualStrings("qianfan/custom-model", agent.model_name);
+    try std.testing.expectEqualStrings("qianfan/custom-model", agent.default_model);
+    try std.testing.expectEqual(@as(u32, 32_768), agent.max_tokens);
+}
+
+test "slash /model resolves provider max_tokens fallback" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.max_tokens = 111;
+
+    const response = (try agent.handleSlashCommand("/model qianfan/custom-model")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "qianfan/custom-model") != null);
+    try std.testing.expectEqualStrings("qianfan/custom-model", agent.model_name);
+    try std.testing.expectEqual(@as(u32, 32_768), agent.max_tokens);
+}
+
+test "slash /model keeps explicit token_limit override" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.token_limit_override = 64_000;
+    agent.token_limit = 64_000;
+    agent.max_tokens_override = 1024;
+    agent.max_tokens = 1024;
+
+    const response = (try agent.handleSlashCommand("/model claude-opus-4-6")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "claude-opus-4-6") != null);
+    try std.testing.expectEqual(@as(u64, 64_000), agent.token_limit);
+    try std.testing.expectEqual(@as(u32, 1024), agent.max_tokens);
 }
 
 test "slash /model without name shows current" {
@@ -1973,6 +2432,111 @@ test "slash /model list aliases to model status" {
 
     try std.testing.expect(std.mem.indexOf(u8, response, "Current model: test-model") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "Switch: /model <name>") != null);
+}
+
+test "slash /memory list hides internal autosave and hygiene entries by default" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("autosave_user_1", "hello", .conversation, null);
+    try mem.store("last_hygiene_at", "1772051598", .core, null);
+    try mem.store("MEMORY:99", "**last_hygiene_at**: 1772051691", .core, null);
+    try mem.store("user_language", "ru", .core, null);
+
+    const resolved = memory_mod.ResolvedConfig{
+        .primary_backend = "test",
+        .retrieval_mode = "keyword",
+        .vector_mode = "none",
+        .embedding_provider = "none",
+        .rollout_mode = "off",
+        .vector_sync_mode = "best_effort",
+        .hygiene_enabled = false,
+        .snapshot_enabled = false,
+        .cache_enabled = false,
+        .semantic_cache_enabled = false,
+        .summarizer_enabled = false,
+        .source_count = 0,
+        .fallback_policy = "degrade",
+    };
+    var rt = memory_mod.MemoryRuntime{
+        .memory = mem,
+        .session_store = null,
+        .response_cache = null,
+        .capabilities = .{
+            .supports_keyword_rank = false,
+            .supports_session_store = false,
+            .supports_transactions = false,
+            .supports_outbox = false,
+        },
+        .resolved = resolved,
+        ._db_path = null,
+        ._cache_db_path = null,
+        ._engine = null,
+        ._allocator = allocator,
+    };
+    agent.mem_rt = &rt;
+
+    const response = (try agent.handleSlashCommand("/memory list --limit 10")).?;
+    defer allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "user_language") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "autosave_user_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "last_hygiene_at") == null);
+}
+
+test "slash /memory list includes internal entries when requested" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("autosave_user_1", "hello", .conversation, null);
+    try mem.store("last_hygiene_at", "1772051598", .core, null);
+
+    const resolved = memory_mod.ResolvedConfig{
+        .primary_backend = "test",
+        .retrieval_mode = "keyword",
+        .vector_mode = "none",
+        .embedding_provider = "none",
+        .rollout_mode = "off",
+        .vector_sync_mode = "best_effort",
+        .hygiene_enabled = false,
+        .snapshot_enabled = false,
+        .cache_enabled = false,
+        .semantic_cache_enabled = false,
+        .summarizer_enabled = false,
+        .source_count = 0,
+        .fallback_policy = "degrade",
+    };
+    var rt = memory_mod.MemoryRuntime{
+        .memory = mem,
+        .session_store = null,
+        .response_cache = null,
+        .capabilities = .{
+            .supports_keyword_rank = false,
+            .supports_session_store = false,
+            .supports_transactions = false,
+            .supports_outbox = false,
+        },
+        .resolved = resolved,
+        ._db_path = null,
+        ._cache_db_path = null,
+        ._engine = null,
+        ._allocator = allocator,
+    };
+    agent.mem_rt = &rt;
+
+    const response = (try agent.handleSlashCommand("/memory list --limit 10 --include-internal")).?;
+    defer allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "autosave_user_1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "last_hygiene_at") != null);
 }
 
 test "slash /model shows provider and model fallback chains" {
@@ -2259,6 +2823,93 @@ test "turn includes reasoning and usage footer when enabled" {
     try std.testing.expect(std.mem.indexOf(u8, response, "final answer") != null);
 }
 
+test "turn refreshes system prompt after workspace markdown change" {
+    const ReloadProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, "ok"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "reload-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("SOUL.md", .{});
+        defer f.close();
+        try f.writeAll("SOUL-V1");
+    }
+
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    var provider_state: u8 = 0;
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = ReloadProvider.chatWithSystem,
+        .chat = ReloadProvider.chat,
+        .supportsNativeTools = ReloadProvider.supportsNativeTools,
+        .getName = ReloadProvider.getName,
+        .deinit = ReloadProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = workspace,
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    const first = try agent.turn("first");
+    defer allocator.free(first);
+    try std.testing.expect(agent.history.items.len > 0);
+    try std.testing.expectEqual(providers.Role.system, agent.history.items[0].role);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "SOUL-V1") != null);
+
+    {
+        const f = try tmp.dir.createFile("SOUL.md", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("SOUL-V2-UPDATED");
+    }
+
+    const second = try agent.turn("second");
+    defer allocator.free(second);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "SOUL-V2-UPDATED") != null);
+}
+
 test "exec security deny blocks shell tool execution" {
     const allocator = std.testing.allocator;
     const shell_impl = try allocator.create(tools_mod.shell.ShellTool);
@@ -2453,8 +3104,9 @@ test "bindMemoryTools wires memory tools to sqlite backend" {
     const tools = try tools_mod.allTools(allocator, cfg.workspace_dir, .{});
     defer tools_mod.deinitTools(allocator, tools);
 
-    var mem = try memory_mod.createMemory(allocator, "sqlite", ":memory:");
-    defer mem.deinit();
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    var mem = sqlite_mem.memory();
     tools_mod.bindMemoryTools(tools, mem);
 
     const DummyProvider = struct {
@@ -2677,4 +3329,19 @@ test "Agent streaming fields can be set" {
 
     try std.testing.expect(agent.stream_callback != null);
     try std.testing.expect(agent.stream_ctx != null);
+}
+
+test "Agent shouldForceActionFollowThrough detects english deferred promise" {
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("I'll try again with a different filename now."));
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("let me check that and get back in a moment"));
+}
+
+test "Agent shouldForceActionFollowThrough detects russian deferred promise" {
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("Сейчас попробую переснять и отправить файл."));
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("сейчас проверю и вернусь с результатом"));
+}
+
+test "Agent shouldForceActionFollowThrough ignores normal final answer" {
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("Вот результат: файл успешно отправлен."));
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("I cannot do that in this environment."));
 }

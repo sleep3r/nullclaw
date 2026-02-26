@@ -7,6 +7,12 @@
 //!   - Factory function: createEmbeddingProvider()
 
 const std = @import("std");
+const build_options = @import("build_options");
+const appendJsonEscaped = @import("../../util.zig").appendJsonEscaped;
+const GeminiEmbedding = @import("embeddings_gemini.zig").GeminiEmbedding;
+const VoyageEmbedding = @import("embeddings_voyage.zig").VoyageEmbedding;
+const OllamaEmbedding = @import("embeddings_ollama.zig").OllamaEmbedding;
+const net_security = @import("../../net_security.zig");
 
 // ── Embedding provider vtable ─────────────────────────────────────
 
@@ -94,12 +100,22 @@ pub const OpenAiEmbedding = struct {
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, model: []const u8, dims: u32) !*Self {
+        try validateEmbeddingBaseUrl(base_url);
+
         const self_ = try allocator.create(Self);
+        errdefer allocator.destroy(self_);
+
+        const owned_url = try allocator.dupe(u8, base_url);
+        errdefer allocator.free(owned_url);
+        const owned_key = try allocator.dupe(u8, api_key);
+        errdefer allocator.free(owned_key);
+        const owned_model = try allocator.dupe(u8, model);
+
         self_.* = .{
             .allocator = allocator,
-            .base_url = try allocator.dupe(u8, base_url),
-            .api_key = try allocator.dupe(u8, api_key),
-            .model = try allocator.dupe(u8, model),
+            .base_url = owned_url,
+            .api_key = owned_key,
+            .model = owned_model,
             .dims = dims,
         };
         return self_;
@@ -148,34 +164,9 @@ pub const OpenAiEmbedding = struct {
         defer body_buf.deinit(allocator);
 
         try body_buf.appendSlice(allocator, "{\"model\":\"");
-        // Escape model name
-        for (self_.model) |ch| {
-            if (ch == '"') {
-                try body_buf.appendSlice(allocator, "\\\"");
-            } else {
-                try body_buf.append(allocator, ch);
-            }
-        }
+        try appendJsonEscaped(&body_buf, allocator, self_.model);
         try body_buf.appendSlice(allocator, "\",\"input\":\"");
-        // Escape text
-        for (text) |ch| {
-            switch (ch) {
-                '"' => try body_buf.appendSlice(allocator, "\\\""),
-                '\\' => try body_buf.appendSlice(allocator, "\\\\"),
-                '\n' => try body_buf.appendSlice(allocator, "\\n"),
-                '\r' => try body_buf.appendSlice(allocator, "\\r"),
-                '\t' => try body_buf.appendSlice(allocator, "\\t"),
-                else => {
-                    if (ch < 0x20) {
-                        var hex_buf: [6]u8 = undefined;
-                        const hex = std.fmt.bufPrint(&hex_buf, "\\u{x:0>4}", .{ch}) catch continue;
-                        try body_buf.appendSlice(allocator, hex);
-                    } else {
-                        try body_buf.append(allocator, ch);
-                    }
-                },
-            }
-        }
+        try appendJsonEscaped(&body_buf, allocator, text);
         try body_buf.appendSlice(allocator, "\"}");
 
         const url = try self_.embeddingsUrl(allocator);
@@ -249,6 +240,21 @@ fn hasExplicitApiPath(url: []const u8) bool {
     return trimmed.len > 0 and !std.mem.eql(u8, trimmed, "/");
 }
 
+/// Require a parseable HTTP(S) endpoint. Plain HTTP is only allowed on local hosts.
+fn validateEmbeddingBaseUrl(url: []const u8) !void {
+    if (url.len == 0) return error.InvalidEmbeddingApiUrl;
+    _ = std.Uri.parse(url) catch return error.InvalidEmbeddingApiUrl;
+
+    const is_https = std.mem.startsWith(u8, url, "https://");
+    const is_http = std.mem.startsWith(u8, url, "http://");
+    if (!is_https and !is_http) return error.InvalidEmbeddingApiUrl;
+
+    if (is_http) {
+        const host = net_security.extractHost(url) orelse return error.InvalidEmbeddingApiUrl;
+        if (!net_security.isLocalHost(host)) return error.InsecureEmbeddingApiUrl;
+    }
+}
+
 /// Parse an OpenAI-compatible embeddings API response to extract the embedding vector.
 fn parseEmbeddingResponse(allocator: std.mem.Allocator, json_bytes: []const u8) ![]f32 {
     // We need to find the "embedding" array inside "data"[0]
@@ -257,8 +263,11 @@ fn parseEmbeddingResponse(allocator: std.mem.Allocator, json_bytes: []const u8) 
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{}) catch return error.InvalidEmbeddingResponse;
     defer parsed.deinit();
 
-    const root = parsed.value;
-    const data = root.object.get("data") orelse return error.InvalidEmbeddingResponse;
+    const root = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidEmbeddingResponse,
+    };
+    const data = root.get("data") orelse return error.InvalidEmbeddingResponse;
     const data_array = switch (data) {
         .array => |a| a,
         else => return error.InvalidEmbeddingResponse,
@@ -276,11 +285,12 @@ fn parseEmbeddingResponse(allocator: std.mem.Allocator, json_bytes: []const u8) 
     };
 
     const result = try allocator.alloc(f32, emb_array.items.len);
+    errdefer allocator.free(result);
     for (emb_array.items, 0..) |val, i| {
         result[i] = switch (val) {
             .float => |f| @floatCast(f),
             .integer => |n| @floatFromInt(n),
-            else => 0.0,
+            else => return error.InvalidEmbeddingResponse,
         };
     }
     return result;
@@ -288,16 +298,39 @@ fn parseEmbeddingResponse(allocator: std.mem.Allocator, json_bytes: []const u8) 
 
 // ── Embedding cache ───────────────────────────────────────────────
 
-const sqlite_mod = @import("sqlite.zig");
+const sqlite_mod = if (build_options.enable_sqlite) @import("../engines/sqlite.zig") else @import("../engines/sqlite_disabled.zig");
 const SqliteMemory = sqlite_mod.SqliteMemory;
 const c = sqlite_mod.c;
 const SQLITE_STATIC = sqlite_mod.SQLITE_STATIC;
 
 /// Compute a content hash for embedding cache lookups.
 /// SHA-256 the content, take first 8 bytes, format as 16 hex characters.
+///
+/// IMPORTANT: For cache correctness, callers should use `contentHashWithModel`
+/// instead, which includes the model name in the hash. Using this function
+/// alone risks returning stale embeddings if the embedding model changes.
 pub fn contentHash(content: []const u8) [16]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(content, &digest, .{});
+
+    var result: [16]u8 = undefined;
+    const hex_chars = "0123456789abcdef";
+    for (0..8) |i| {
+        result[i * 2] = hex_chars[digest[i] >> 4];
+        result[i * 2 + 1] = hex_chars[digest[i] & 0x0f];
+    }
+    return result;
+}
+
+/// Compute a content hash that includes the model name.
+/// This prevents returning stale cached embeddings when the model changes.
+pub fn contentHashWithModel(content: []const u8, model: []const u8) [16]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(model);
+    hasher.update("\x00"); // separator to prevent "modelAcontentB" == "modelAcontent" + "B"
+    hasher.update(content);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
 
     var result: [16]u8 = undefined;
     const hex_chars = "0123456789abcdef";
@@ -374,7 +407,7 @@ pub fn getCachedEmbedding(db: *SqliteMemory, content_hash: []const u8, allocator
         result[i] = switch (val) {
             .float => |f| @floatCast(f),
             .integer => |n| @floatFromInt(n),
-            else => 0.0,
+            else => return error.InvalidEmbeddingCache,
         };
     }
     return result;
@@ -433,6 +466,38 @@ pub fn createEmbeddingProvider(
             api_key orelse "",
             model,
             dims,
+        );
+        return impl_.provider();
+    }
+
+    if (std.mem.eql(u8, provider_name, "gemini")) {
+        var impl_ = try GeminiEmbedding.init(
+            allocator,
+            api_key orelse "",
+            if (model.len > 0) model else null,
+            null,
+            if (dims > 0) dims else null,
+        );
+        return impl_.provider();
+    }
+
+    if (std.mem.eql(u8, provider_name, "voyage")) {
+        var impl_ = try VoyageEmbedding.init(
+            allocator,
+            api_key orelse "",
+            if (model.len > 0) model else null,
+            null,
+            if (dims > 0) dims else null,
+        );
+        return impl_.provider();
+    }
+
+    if (std.mem.eql(u8, provider_name, "ollama")) {
+        var impl_ = try OllamaEmbedding.init(
+            allocator,
+            if (model.len > 0) model else null,
+            null,
+            if (dims > 0) dims else null,
         );
         return impl_.provider();
     }
@@ -517,6 +582,29 @@ test "OpenAiEmbedding init and deinit" {
     p.deinit();
 }
 
+test "OpenAiEmbedding init rejects insecure remote http url" {
+    const result = OpenAiEmbedding.init(
+        std.testing.allocator,
+        "http://example.com",
+        "test-key",
+        "text-embedding-3-small",
+        1536,
+    );
+    try std.testing.expectError(error.InsecureEmbeddingApiUrl, result);
+}
+
+test "OpenAiEmbedding init accepts localhost http url" {
+    var impl_ = try OpenAiEmbedding.init(
+        std.testing.allocator,
+        "http://127.0.0.1:11434",
+        "test-key",
+        "text-embedding-3-small",
+        1536,
+    );
+    const p = impl_.provider();
+    p.deinit();
+}
+
 test "OpenAiEmbedding embeddingsUrl standard" {
     var impl_ = try OpenAiEmbedding.init(
         std.testing.allocator,
@@ -584,6 +672,59 @@ test "createEmbeddingProvider openai is heap allocated and deinit frees memory" 
     p.deinit();
 }
 
+test "createEmbeddingProvider gemini" {
+    const p = try createEmbeddingProvider(std.testing.allocator, "gemini", "test-key", "", 0);
+    try std.testing.expectEqualStrings("gemini", p.getName());
+    try std.testing.expectEqual(@as(u32, 768), p.getDimensions());
+    p.deinit();
+}
+
+test "createEmbeddingProvider gemini with custom model" {
+    const p = try createEmbeddingProvider(std.testing.allocator, "gemini", "test-key", "gemini-embedding-001", 1024);
+    try std.testing.expectEqualStrings("gemini", p.getName());
+    try std.testing.expectEqual(@as(u32, 1024), p.getDimensions());
+    p.deinit();
+}
+
+test "createEmbeddingProvider voyage" {
+    const p = try createEmbeddingProvider(std.testing.allocator, "voyage", "test-key", "", 0);
+    try std.testing.expectEqualStrings("voyage", p.getName());
+    try std.testing.expectEqual(@as(u32, 512), p.getDimensions());
+    p.deinit();
+}
+
+test "createEmbeddingProvider voyage with custom model" {
+    const p = try createEmbeddingProvider(std.testing.allocator, "voyage", "test-key", "voyage-3", 1024);
+    try std.testing.expectEqualStrings("voyage", p.getName());
+    try std.testing.expectEqual(@as(u32, 1024), p.getDimensions());
+    p.deinit();
+}
+
+test "createEmbeddingProvider ollama" {
+    const p = try createEmbeddingProvider(std.testing.allocator, "ollama", null, "", 0);
+    try std.testing.expectEqualStrings("ollama", p.getName());
+    try std.testing.expectEqual(@as(u32, 768), p.getDimensions());
+    p.deinit();
+}
+
+test "createEmbeddingProvider ollama with custom model" {
+    const p = try createEmbeddingProvider(std.testing.allocator, "ollama", null, "mxbai-embed-large", 1024);
+    try std.testing.expectEqualStrings("ollama", p.getName());
+    try std.testing.expectEqual(@as(u32, 1024), p.getDimensions());
+    p.deinit();
+}
+
+test "createEmbeddingProvider custom rejects insecure remote http url" {
+    const provider = createEmbeddingProvider(
+        std.testing.allocator,
+        "custom:http://example.com/v1",
+        "test-key",
+        "text-embedding-3-small",
+        1536,
+    );
+    try std.testing.expectError(error.InsecureEmbeddingApiUrl, provider);
+}
+
 // ── Embedding cache tests ─────────────────────────────────────────
 
 test "contentHash produces 16 hex chars" {
@@ -604,6 +745,25 @@ test "contentHash is deterministic" {
 test "contentHash differs for different inputs" {
     const h1 = contentHash("alpha");
     const h2 = contentHash("beta");
+    try std.testing.expect(!std.mem.eql(u8, &h1, &h2));
+}
+
+test "contentHashWithModel differs by model" {
+    const h1 = contentHashWithModel("same text", "text-embedding-3-small");
+    const h2 = contentHashWithModel("same text", "text-embedding-3-large");
+    try std.testing.expect(!std.mem.eql(u8, &h1, &h2));
+}
+
+test "contentHashWithModel same model same content is deterministic" {
+    const h1 = contentHashWithModel("hello", "model-a");
+    const h2 = contentHashWithModel("hello", "model-a");
+    try std.testing.expectEqualSlices(u8, &h1, &h2);
+}
+
+test "contentHashWithModel differs from contentHash" {
+    const h1 = contentHash("hello");
+    const h2 = contentHashWithModel("hello", "");
+    // Even with empty model, the null separator makes them differ
     try std.testing.expect(!std.mem.eql(u8, &h1, &h2));
 }
 
@@ -707,4 +867,64 @@ test "cacheEmbedding empty vector" {
     try std.testing.expect(cached != null);
     defer std.testing.allocator.free(cached.?);
     try std.testing.expectEqual(@as(usize, 0), cached.?.len);
+}
+
+// ── R3 regression tests ───────────────────────────────────────────
+
+test "parseEmbeddingResponse valid extracts correct f32 array" {
+    const json =
+        \\{"data":[{"embedding":[0.5,-0.25,1.0,0.0]}]}
+    ;
+    const result = try parseEmbeddingResponse(std.testing.allocator, json);
+    defer std.testing.allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 4), result.len);
+    try std.testing.expect(@abs(result[0] - 0.5) < 0.0001);
+    try std.testing.expect(@abs(result[1] - (-0.25)) < 0.0001);
+    try std.testing.expect(@abs(result[2] - 1.0) < 0.0001);
+    try std.testing.expect(@abs(result[3] - 0.0) < 0.0001);
+}
+
+test "parseEmbeddingResponse root is array not object returns error" {
+    const json =
+        \\[{"embedding":[0.1,0.2]}]
+    ;
+    const result = parseEmbeddingResponse(std.testing.allocator, json);
+    try std.testing.expectError(error.InvalidEmbeddingResponse, result);
+}
+
+test "parseEmbeddingResponse string value in embedding returns error not silent 0" {
+    const json =
+        \\{"data":[{"embedding":[0.1,"bad",0.3]}]}
+    ;
+    const result = parseEmbeddingResponse(std.testing.allocator, json);
+    try std.testing.expectError(error.InvalidEmbeddingResponse, result);
+}
+
+test "parseEmbeddingResponse null value in embedding returns error" {
+    const json =
+        \\{"data":[{"embedding":[0.1,null,0.3]}]}
+    ;
+    const result = parseEmbeddingResponse(std.testing.allocator, json);
+    try std.testing.expectError(error.InvalidEmbeddingResponse, result);
+}
+
+test "parseEmbeddingResponse bool value in embedding returns error" {
+    const json =
+        \\{"data":[{"embedding":[0.1,true,0.3]}]}
+    ;
+    const result = parseEmbeddingResponse(std.testing.allocator, json);
+    try std.testing.expectError(error.InvalidEmbeddingResponse, result);
+}
+
+test "contentHashWithModel different models same text produce different hashes" {
+    const h1 = contentHashWithModel("identical text", "model-alpha");
+    const h2 = contentHashWithModel("identical text", "model-beta");
+    try std.testing.expect(!std.mem.eql(u8, &h1, &h2));
+}
+
+test "contentHashWithModel same model different text produce different hashes" {
+    const h1 = contentHashWithModel("text one", "model-x");
+    const h2 = contentHashWithModel("text two", "model-x");
+    try std.testing.expect(!std.mem.eql(u8, &h1, &h2));
 }

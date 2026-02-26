@@ -2,6 +2,7 @@ const std = @import("std");
 const platform = @import("../platform.zig");
 const root = @import("root.zig");
 const error_classify = @import("error_classify.zig");
+const config_types = @import("../config_types.zig");
 
 const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
@@ -148,7 +149,7 @@ pub const GeminiProvider = struct {
     allocator: std.mem.Allocator,
 
     const BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
-    const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8192;
+    const DEFAULT_MAX_OUTPUT_TOKENS: u32 = config_types.DEFAULT_MODEL_MAX_TOKENS;
 
     pub fn init(allocator: std.mem.Allocator, api_key: ?[]const u8) GeminiProvider {
         var auth: ?GeminiAuth = null;
@@ -482,8 +483,9 @@ fn buildChatRequestBody(
     const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.GeminiApiError;
     try buf.appendSlice(allocator, temp_str);
     try buf.appendSlice(allocator, ",\"maxOutputTokens\":");
+    const max_output_tokens = request.max_tokens orelse GeminiProvider.DEFAULT_MAX_OUTPUT_TOKENS;
     var max_buf: [16]u8 = undefined;
-    const max_str = std.fmt.bufPrint(&max_buf, "{d}", .{GeminiProvider.DEFAULT_MAX_OUTPUT_TOKENS}) catch return error.GeminiApiError;
+    const max_str = std.fmt.bufPrint(&max_buf, "{d}", .{max_output_tokens}) catch return error.GeminiApiError;
     try buf.appendSlice(allocator, max_str);
     try buf.appendSlice(allocator, "}}");
 
@@ -803,6 +805,25 @@ test "gemini buildChatRequestBody plain text" {
     const parts = contents.items[0].object.get("parts").?.array;
     try std.testing.expectEqual(@as(usize, 1), parts.items.len);
     try std.testing.expectEqualStrings("Hello", parts.items[0].object.get("text").?.string);
+}
+
+test "gemini buildChatRequestBody honors request max_tokens override" {
+    const alloc = std.testing.allocator;
+    var msgs = [_]root.ChatMessage{
+        root.ChatMessage.user("Hello"),
+    };
+    const body = try buildChatRequestBody(alloc, .{
+        .messages = &msgs,
+        .max_tokens = 2048,
+    }, 0.7);
+    defer alloc.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const generation_config = parsed.value.object.get("generationConfig").?.object;
+    const max_output = generation_config.get("maxOutputTokens").?;
+    try std.testing.expect(max_output == .integer);
+    try std.testing.expectEqual(@as(i64, 2048), max_output.integer);
 }
 
 test "gemini buildChatRequestBody with content_parts inlineData" {

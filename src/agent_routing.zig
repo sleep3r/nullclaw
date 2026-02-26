@@ -1,4 +1,4 @@
-//! Agent Routing — OpenClaw-compatible agent bindings routing system.
+//! Agent Routing — agent bindings routing system.
 //!
 //! Routes incoming messages to the correct agent based on a tiered matching
 //! system. Bindings are checked against the input in priority order:
@@ -870,7 +870,8 @@ test "resolveLinkedPeerId — unmatched returns original" {
 test "buildSessionKeyWithScope — per_channel_peer (default)" {
     const allocator = std.testing.allocator;
     const key = try buildSessionKeyWithScope(allocator, "bot1", "discord", .{
-        .kind = .direct, .id = "user42",
+        .kind = .direct,
+        .id = "user42",
     }, .per_channel_peer, null, &.{});
     defer allocator.free(key);
     try std.testing.expectEqualStrings("agent:bot1:discord:direct:user42", key);
@@ -879,7 +880,8 @@ test "buildSessionKeyWithScope — per_channel_peer (default)" {
 test "buildSessionKeyWithScope — main scope" {
     const allocator = std.testing.allocator;
     const key = try buildSessionKeyWithScope(allocator, "bot1", "discord", .{
-        .kind = .direct, .id = "user42",
+        .kind = .direct,
+        .id = "user42",
     }, .main, null, &.{});
     defer allocator.free(key);
     try std.testing.expectEqualStrings("agent:bot1:main", key);
@@ -888,7 +890,8 @@ test "buildSessionKeyWithScope — main scope" {
 test "buildSessionKeyWithScope — per_peer scope" {
     const allocator = std.testing.allocator;
     const key = try buildSessionKeyWithScope(allocator, "bot1", "discord", .{
-        .kind = .direct, .id = "user42",
+        .kind = .direct,
+        .id = "user42",
     }, .per_peer, null, &.{});
     defer allocator.free(key);
     try std.testing.expectEqualStrings("agent:bot1:direct:user42", key);
@@ -897,7 +900,8 @@ test "buildSessionKeyWithScope — per_peer scope" {
 test "buildSessionKeyWithScope — per_account_channel_peer scope" {
     const allocator = std.testing.allocator;
     const key = try buildSessionKeyWithScope(allocator, "bot1", "discord", .{
-        .kind = .direct, .id = "user42",
+        .kind = .direct,
+        .id = "user42",
     }, .per_account_channel_peer, "work", &.{});
     defer allocator.free(key);
     try std.testing.expectEqualStrings("agent:bot1:discord:work:direct:user42", key);
@@ -906,7 +910,8 @@ test "buildSessionKeyWithScope — per_account_channel_peer scope" {
 test "buildSessionKeyWithScope — group always per-channel" {
     const allocator = std.testing.allocator;
     const key = try buildSessionKeyWithScope(allocator, "bot1", "discord", .{
-        .kind = .group, .id = "G123",
+        .kind = .group,
+        .id = "G123",
     }, .main, null, &.{});
     defer allocator.free(key);
     try std.testing.expectEqualStrings("agent:bot1:discord:group:G123", key);
@@ -919,7 +924,8 @@ test "buildSessionKeyWithScope — identity link resolves peer" {
         .peers = &.{"telegram:123"},
     }};
     const key = try buildSessionKeyWithScope(allocator, "bot1", "telegram", .{
-        .kind = .direct, .id = "telegram:123",
+        .kind = .direct,
+        .id = "telegram:123",
     }, .per_channel_peer, null, &links);
     defer allocator.free(key);
     try std.testing.expectEqualStrings("agent:bot1:telegram:direct:alice", key);
@@ -1250,9 +1256,13 @@ test "dmScope controls direct-message session key isolation" {
 test "per_account_channel_peer isolates per account, channel, sender" {
     const allocator = std.testing.allocator;
     const key = try buildSessionKeyWithScope(
-        allocator, "main", "telegram",
+        allocator,
+        "main",
+        "telegram",
         .{ .kind = .direct, .id = "7550356539" },
-        .per_account_channel_peer, "tasks", &.{},
+        .per_account_channel_peer,
+        "tasks",
+        &.{},
     );
     defer allocator.free(key);
     try std.testing.expectEqualStrings("agent:main:telegram:tasks:direct:7550356539", key);
@@ -1261,9 +1271,13 @@ test "per_account_channel_peer isolates per account, channel, sender" {
 test "per_account_channel_peer uses default when account not provided" {
     const allocator = std.testing.allocator;
     const key = try buildSessionKeyWithScope(
-        allocator, "main", "telegram",
+        allocator,
+        "main",
+        "telegram",
         .{ .kind = .direct, .id = "7550356539" },
-        .per_account_channel_peer, null, &.{},
+        .per_account_channel_peer,
+        null,
+        &.{},
     );
     defer allocator.free(key);
     try std.testing.expectEqualStrings("agent:main:telegram:default:direct:7550356539", key);
@@ -1276,9 +1290,13 @@ test "identityLinks applies to per_peer scope" {
         .peers = &.{ "telegram:111111111", "discord:222222222222222222" },
     }};
     const key = try buildSessionKeyWithScope(
-        allocator, "main", "telegram",
+        allocator,
+        "main",
+        "telegram",
         .{ .kind = .direct, .id = "telegram:111111111" },
-        .per_peer, null, &links,
+        .per_peer,
+        null,
+        &links,
     );
     defer allocator.free(key);
     try std.testing.expectEqualStrings("agent:main:direct:alice", key);
@@ -1291,9 +1309,13 @@ test "identityLinks applies to per_channel_peer scope" {
         .peers = &.{ "telegram:111111111", "discord:222222222222222222" },
     }};
     const key = try buildSessionKeyWithScope(
-        allocator, "main", "discord",
+        allocator,
+        "main",
+        "discord",
         .{ .kind = .direct, .id = "discord:222222222222222222" },
-        .per_channel_peer, null, &links,
+        .per_channel_peer,
+        null,
+        &links,
     );
     defer allocator.free(key);
     try std.testing.expectEqualStrings("agent:main:discord:direct:alice", key);
@@ -1304,15 +1326,23 @@ test "identityLinks applies to per_channel_peer scope" {
 test "distinct keys for DM vs channel — main scope" {
     const allocator = std.testing.allocator;
     const dm_key = try buildSessionKeyWithScope(
-        allocator, "main", "discord",
+        allocator,
+        "main",
+        "discord",
         .{ .kind = .direct, .id = "user123" },
-        .main, "default", &.{},
+        .main,
+        "default",
+        &.{},
     );
     defer allocator.free(dm_key);
     const group_key = try buildSessionKeyWithScope(
-        allocator, "main", "discord",
+        allocator,
+        "main",
+        "discord",
         .{ .kind = .channel, .id = "channel456" },
-        .main, "default", &.{},
+        .main,
+        "default",
+        &.{},
     );
     defer allocator.free(group_key);
     try std.testing.expectEqualStrings("agent:main:main", dm_key);
@@ -1323,15 +1353,23 @@ test "distinct keys for DM vs channel — main scope" {
 test "distinct keys for DM vs channel — per_peer scope" {
     const allocator = std.testing.allocator;
     const dm_key = try buildSessionKeyWithScope(
-        allocator, "main", "discord",
+        allocator,
+        "main",
+        "discord",
         .{ .kind = .direct, .id = "user123" },
-        .per_peer, "default", &.{},
+        .per_peer,
+        "default",
+        &.{},
     );
     defer allocator.free(dm_key);
     const group_key = try buildSessionKeyWithScope(
-        allocator, "main", "discord",
+        allocator,
+        "main",
+        "discord",
         .{ .kind = .channel, .id = "channel456" },
-        .per_peer, "default", &.{},
+        .per_peer,
+        "default",
+        &.{},
     );
     defer allocator.free(group_key);
     try std.testing.expectEqualStrings("agent:main:direct:user123", dm_key);

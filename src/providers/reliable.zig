@@ -293,6 +293,7 @@ pub const ReliableProvider = struct {
         const err_slice = self.lastErrorSlice();
         if (isContextExhausted(err_slice)) return error.ContextLengthExceeded;
         if (isRateLimited(err_slice)) return error.RateLimited;
+        if (std.mem.eql(u8, err_slice, "ProviderDoesNotSupportVision")) return error.ProviderDoesNotSupportVision;
         return error.AllProvidersFailed;
     }
 

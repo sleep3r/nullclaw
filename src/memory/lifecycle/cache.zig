@@ -5,11 +5,11 @@
 //! TTL. The cache is optional and disabled by default.
 
 const std = @import("std");
-const c = @cImport({
-    @cInclude("sqlite3.h");
-});
-
-const SQLITE_STATIC: c.sqlite3_destructor_type = null;
+const builtin = @import("builtin");
+const build_options = @import("build_options");
+const sqlite_mod = if (build_options.enable_sqlite) @import("../engines/sqlite.zig") else @import("../engines/sqlite_disabled.zig");
+const c = sqlite_mod.c;
+const SQLITE_STATIC = sqlite_mod.SQLITE_STATIC;
 
 pub const ResponseCache = struct {
     db: ?*c.sqlite3,
@@ -19,6 +19,11 @@ pub const ResponseCache = struct {
     const Self = @This();
 
     pub fn init(db_path: [*:0]const u8, ttl_minutes: u32, max_entries: usize) !Self {
+        if (!build_options.enable_sqlite) {
+            if (builtin.is_test) return error.SkipZigTest;
+            return error.SqliteOpenFailed;
+        }
+
         var db: ?*c.sqlite3 = null;
         const rc = c.sqlite3_open(db_path, &db);
         if (rc != c.SQLITE_OK) {
@@ -69,13 +74,21 @@ pub const ResponseCache = struct {
     }
 
     /// Build a deterministic cache key from model + system prompt + user prompt.
-    /// Uses a simple hash (FNV-1a) since we don't have SHA-256 in std.
+    /// Uses length-prefixed hashing to prevent delimiter-collision attacks
+    /// (e.g. model="a|" + sys="b" vs model="a" + sys="|b").
     pub fn cacheKey(model: []const u8, system_prompt: ?[]const u8, user_prompt: []const u8) u64 {
         var hasher = std.hash.Fnv1a_64.init();
+        // Length-prefix each field so boundaries are unambiguous
+        hasher.update(std.mem.asBytes(&@as(u32, @intCast(model.len))));
         hasher.update(model);
-        hasher.update("|");
-        if (system_prompt) |sys| hasher.update(sys);
-        hasher.update("|");
+        if (system_prompt) |sys| {
+            hasher.update(std.mem.asBytes(&@as(u32, @intCast(sys.len))));
+            hasher.update(sys);
+        } else {
+            // Distinct sentinel for null vs empty string
+            hasher.update(&[_]u8{ 0xff, 0xff, 0xff, 0xff });
+        }
+        hasher.update(std.mem.asBytes(&@as(u32, @intCast(user_prompt.len))));
         hasher.update(user_prompt);
         return hasher.final();
     }
@@ -441,6 +454,21 @@ test "cache key includes system prompt in hash" {
     try std.testing.expect(k1 != k2);
 }
 
+test "cache key no delimiter collision" {
+    // With naive "|" delimiter, these would collide:
+    //   model="a" sys="|b"  prompt="c"  -> hash("a||b|c")
+    //   model="a" sys=""    prompt="b|c" -> hash("a||b|c")
+    // Length-prefixed hashing prevents this.
+    const k1 = ResponseCache.cacheKey("a", "|b", "c");
+    const k2 = ResponseCache.cacheKey("a", "", "b|c");
+    try std.testing.expect(k1 != k2);
+
+    // Also: null sys vs empty sys must differ
+    const k3 = ResponseCache.cacheKey("m", null, "p");
+    const k4 = ResponseCache.cacheKey("m", "", "p");
+    try std.testing.expect(k3 != k4);
+}
+
 test "cache unicode prompt handling" {
     var cache_inst = try ResponseCache.init(":memory:", 60, 1000);
     defer cache_inst.deinit();
@@ -615,4 +643,50 @@ test "cache clear returns zero on empty" {
 
     const cleared = try cache_inst.clear();
     try std.testing.expectEqual(@as(usize, 0), cleared);
+}
+
+// ── R3 Tests ──────────────────────────────────────────────────────
+
+test "R3: cache key no delimiter collision — boundary-shifted fields" {
+    // These would collide with a naive delimiter approach:
+    //   ("a", "|b", "c") vs ("a", "", "b|c")
+    // Length-prefixed hashing must distinguish them.
+    const k1 = ResponseCache.cacheKey("a", "|b", "c");
+    const k2 = ResponseCache.cacheKey("a", "", "b|c");
+    try std.testing.expect(k1 != k2);
+
+    // Also verify boundary between model and system_prompt:
+    //   ("ab", "c", "d") vs ("a", "bc", "d")
+    const k3 = ResponseCache.cacheKey("ab", "c", "d");
+    const k4 = ResponseCache.cacheKey("a", "bc", "d");
+    try std.testing.expect(k3 != k4);
+
+    // And boundary between system_prompt and user_prompt:
+    //   ("m", "ab", "c") vs ("m", "a", "bc")
+    const k5 = ResponseCache.cacheKey("m", "ab", "c");
+    const k6 = ResponseCache.cacheKey("m", "a", "bc");
+    try std.testing.expect(k5 != k6);
+}
+
+test "R3: cache store then retrieve verifies content matches" {
+    var cache_inst = try ResponseCache.init(":memory:", 60, 1000);
+    defer cache_inst.deinit();
+
+    const test_response = "This is a detailed response about Zig's comptime features.";
+    var key_buf: [16]u8 = undefined;
+    const key_hex = ResponseCache.cacheKeyHex(&key_buf, "claude-3", "Be helpful", "Tell me about comptime");
+
+    try cache_inst.put(std.testing.allocator, key_hex, "claude-3", test_response, 42);
+
+    // Retrieve and verify exact content
+    const result = try cache_inst.get(std.testing.allocator, key_hex);
+    try std.testing.expect(result != null);
+    defer std.testing.allocator.free(result.?);
+    try std.testing.expectEqualStrings(test_response, result.?);
+
+    // Verify a different key misses
+    var miss_buf: [16]u8 = undefined;
+    const miss_key = ResponseCache.cacheKeyHex(&miss_buf, "claude-3", "Be helpful", "different prompt");
+    const miss_result = try cache_inst.get(std.testing.allocator, miss_key);
+    try std.testing.expect(miss_result == null);
 }

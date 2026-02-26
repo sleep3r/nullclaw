@@ -6,6 +6,7 @@
 const std = @import("std");
 const log = std.log.scoped(.agent);
 const providers = @import("../providers/root.zig");
+const config_types = @import("../config_types.zig");
 const Provider = providers.Provider;
 const ChatMessage = providers.ChatMessage;
 
@@ -26,7 +27,7 @@ pub const DEFAULT_COMPACTION_MAX_SUMMARY_CHARS: u32 = 2_000;
 pub const DEFAULT_COMPACTION_MAX_SOURCE_CHARS: u32 = 12_000;
 
 /// Default token limit for context window (used by token-based compaction trigger).
-pub const DEFAULT_TOKEN_LIMIT: u64 = 128_000;
+pub const DEFAULT_TOKEN_LIMIT: u64 = config_types.DEFAULT_AGENT_TOKEN_LIMIT;
 
 /// Minimum history length before context exhaustion recovery is attempted.
 pub const CONTEXT_RECOVERY_MIN_HISTORY: usize = 6;
@@ -401,7 +402,7 @@ test "autoCompactHistory no-op below count and token thresholds" {
 }
 
 test "DEFAULT_TOKEN_LIMIT constant" {
-    try std.testing.expectEqual(@as(u64, 128_000), DEFAULT_TOKEN_LIMIT);
+    try std.testing.expectEqual(config_types.DEFAULT_AGENT_TOKEN_LIMIT, DEFAULT_TOKEN_LIMIT);
 }
 
 test "forceCompressHistory keeps system + last 4 messages" {

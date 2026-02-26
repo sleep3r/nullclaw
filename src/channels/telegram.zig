@@ -9,6 +9,31 @@ const log = std.log.scoped(.telegram);
 const MEDIA_GROUP_FLUSH_SECS: u64 = 3;
 const TEMP_MEDIA_SWEEP_INTERVAL_POLLS: u32 = 20;
 const TEMP_MEDIA_TTL_SECS: i64 = 24 * 60 * 60;
+const TELEGRAM_BOT_COMMANDS_JSON =
+    \\{"commands":[
+    \\{"command":"start","description":"Start a conversation"},
+    \\{"command":"new","description":"Clear history, start fresh"},
+    \\{"command":"reset","description":"Alias for /new"},
+    \\{"command":"help","description":"Show available commands"},
+    \\{"command":"commands","description":"Alias for /help"},
+    \\{"command":"status","description":"Show model and stats"},
+    \\{"command":"whoami","description":"Show current session id"},
+    \\{"command":"model","description":"Switch model"},
+    \\{"command":"models","description":"Alias for /model"},
+    \\{"command":"think","description":"Set thinking level"},
+    \\{"command":"verbose","description":"Set verbose level"},
+    \\{"command":"reasoning","description":"Set reasoning output"},
+    \\{"command":"exec","description":"Set exec policy"},
+    \\{"command":"queue","description":"Set queue policy"},
+    \\{"command":"usage","description":"Set usage footer mode"},
+    \\{"command":"tts","description":"Set TTS mode"},
+    \\{"command":"memory","description":"Memory tools and diagnostics"},
+    \\{"command":"doctor","description":"Memory diagnostics quick check"},
+    \\{"command":"stop","description":"Stop active background task"},
+    \\{"command":"restart","description":"Restart current session"},
+    \\{"command":"compact","description":"Compact context now"}
+    \\]}
+;
 
 // ════════════════════════════════════════════════════════════════════════════
 // Attachment Types
@@ -158,6 +183,19 @@ fn sanitizeFilenameComponent(out: []u8, input: []const u8, limit: usize) []const
     }
 
     return out[0..w];
+}
+
+fn trimTrailingPathSeparators(path: []const u8) []const u8 {
+    if (path.len == 0) return path;
+    var end = path.len;
+    while (end > 1 and (path[end - 1] == '/' or path[end - 1] == '\\')) : (end -= 1) {}
+    return path[0..end];
+}
+
+fn pathSeparator(base: []const u8) []const u8 {
+    if (base.len == 0) return "";
+    const last = base[base.len - 1];
+    return if (last == '/' or last == '\\') "" else "/";
 }
 
 fn cloneChannelMessage(allocator: std.mem.Allocator, msg: root.ChannelMessage) !root.ChannelMessage {
@@ -500,31 +538,7 @@ pub const TelegramChannel = struct {
         var url_buf: [512]u8 = undefined;
         const url = self.apiUrl(&url_buf, "setMyCommands") catch return;
 
-        const body =
-            \\{"commands":[
-            \\{"command":"start","description":"Start a conversation"},
-            \\{"command":"new","description":"Clear history, start fresh"},
-            \\{"command":"reset","description":"Alias for /new"},
-            \\{"command":"help","description":"Show available commands"},
-            \\{"command":"commands","description":"Alias for /help"},
-            \\{"command":"status","description":"Show model and stats"},
-            \\{"command":"whoami","description":"Show current session id"},
-            \\{"command":"model","description":"Switch model"},
-            \\{"command":"models","description":"Alias for /model"},
-            \\{"command":"think","description":"Set thinking level"},
-            \\{"command":"verbose","description":"Set verbose level"},
-            \\{"command":"reasoning","description":"Set reasoning output"},
-            \\{"command":"exec","description":"Set exec policy"},
-            \\{"command":"queue","description":"Set queue policy"},
-            \\{"command":"usage","description":"Set usage footer mode"},
-            \\{"command":"tts","description":"Set TTS mode"},
-            \\{"command":"stop","description":"Stop active background task"},
-            \\{"command":"restart","description":"Restart current session"},
-            \\{"command":"compact","description":"Compact context now"}
-            \\]}
-        ;
-
-        const resp = root.http_util.curlPostWithProxy(self.allocator, url, body, &.{}, self.proxy, null) catch |err| {
+        const resp = root.http_util.curlPostWithProxy(self.allocator, url, TELEGRAM_BOT_COMMANDS_JSON, &.{}, self.proxy, null) catch |err| {
             log.warn("setMyCommands failed: {}", .{err});
             return;
         };
@@ -728,6 +742,38 @@ pub const TelegramChannel = struct {
 
     // ── Media sending ───────────────────────────────────────────────
 
+    const ResolvedAttachmentPath = struct {
+        path: []const u8,
+        owned: ?[]const u8 = null,
+
+        fn deinit(self: *const ResolvedAttachmentPath, allocator: std.mem.Allocator) void {
+            if (self.owned) |buf| allocator.free(buf);
+        }
+    };
+
+    fn resolveAttachmentPath(allocator: std.mem.Allocator, file_path: []const u8) !ResolvedAttachmentPath {
+        // Remote URL attachments are passed through as-is.
+        if (std.mem.startsWith(u8, file_path, "http://") or
+            std.mem.startsWith(u8, file_path, "https://"))
+        {
+            return .{ .path = file_path };
+        }
+
+        // Expand leading ~/ (or ~\ on Windows) so curl receives an absolute path.
+        if (file_path.len >= 2 and file_path[0] == '~' and (file_path[1] == '/' or file_path[1] == '\\')) {
+            const home = try platform.getHomeDir(allocator);
+            defer allocator.free(home);
+
+            const expanded = try std.fs.path.join(allocator, &.{ home, file_path[2..] });
+            return .{
+                .path = expanded,
+                .owned = expanded,
+            };
+        }
+
+        return .{ .path = file_path };
+    }
+
     /// Send a photo via curl multipart form POST.
     pub fn sendPhoto(self: *TelegramChannel, chat_id: []const u8, allocator: std.mem.Allocator, photo_path: []const u8, caption: ?[]const u8) !void {
         try self.sendMediaMultipart(chat_id, allocator, .image, photo_path, caption);
@@ -749,16 +795,19 @@ pub const TelegramChannel = struct {
     ) !void {
         var url_buf: [512]u8 = undefined;
         const url = try self.apiUrl(&url_buf, kind.apiMethod());
+        const resolved_file_path = try resolveAttachmentPath(allocator, file_path);
+        defer resolved_file_path.deinit(allocator);
+        const media_path = resolved_file_path.path;
 
         // Build file form field: field=@path (local files) or field=URL (remote URLs)
         var file_arg_buf: [1024]u8 = undefined;
         var file_fbs = std.io.fixedBufferStream(&file_arg_buf);
-        if (std.mem.startsWith(u8, file_path, "http://") or
-            std.mem.startsWith(u8, file_path, "https://"))
+        if (std.mem.startsWith(u8, media_path, "http://") or
+            std.mem.startsWith(u8, media_path, "https://"))
         {
-            try file_fbs.writer().print("{s}={s}", .{ kind.formField(), file_path });
+            try file_fbs.writer().print("{s}={s}", .{ kind.formField(), media_path });
         } else {
-            try file_fbs.writer().print("{s}=@{s}", .{ kind.formField(), file_path });
+            try file_fbs.writer().print("{s}=@{s}", .{ kind.formField(), media_path });
         }
         const file_arg = file_fbs.getWritten();
 
@@ -1473,7 +1522,9 @@ pub const TelegramChannel = struct {
         _ = client.fetch(.{
             .location = .{ .url = url },
         }) catch return;
-        // If getMe fails, we still start — healthCheck will report issues
+        // Keep slash-command menu in sync when channel is started via manager/daemon.
+        self.setMyCommands();
+        // If getMe fails, we still start — healthCheck will report issues.
     }
 
     fn vtableStop(ptr: *anyopaque) void {
@@ -1866,7 +1917,8 @@ fn downloadTelegramPhoto(allocator: std.mem.Allocator, bot_token: []const u8, fi
     var path_fbs = std.io.fixedBufferStream(&path_buf);
     var name_buf: [256]u8 = undefined;
     const safe_name = sanitizeFilenameComponent(&name_buf, file_id, 200);
-    path_fbs.writer().print("{s}/nullclaw_photo_{s}{s}", .{ tmp_dir, safe_name, ext }) catch return null;
+    const tmp_base = trimTrailingPathSeparators(tmp_dir);
+    path_fbs.writer().print("{s}{s}nullclaw_photo_{s}{s}", .{ tmp_base, pathSeparator(tmp_base), safe_name, ext }) catch return null;
     const local_path = path_fbs.getWritten();
 
     // Write file
@@ -1943,7 +1995,8 @@ fn downloadTelegramFile(allocator: std.mem.Allocator, bot_token: []const u8, fil
         // Use first 12 chars of file_id as prefix to prevent collisions
         var safe_id: [12]u8 = undefined;
         const safe_id_part = sanitizeFilenameComponent(&safe_id, file_id, 12);
-        path_fbs.writer().print("{s}/nullclaw_doc_{s}_{s}", .{ tmp_dir, safe_id_part, safe_name }) catch return null;
+        const tmp_base = trimTrailingPathSeparators(tmp_dir);
+        path_fbs.writer().print("{s}{s}nullclaw_doc_{s}_{s}", .{ tmp_base, pathSeparator(tmp_base), safe_id_part, safe_name }) catch return null;
     } else {
         // Fall back to file_id with extension from tg_file_path
         const ext = if (std.mem.lastIndexOfScalar(u8, tg_file_path, '.')) |dot|
@@ -1952,7 +2005,8 @@ fn downloadTelegramFile(allocator: std.mem.Allocator, bot_token: []const u8, fil
             "";
         var name_buf: [256]u8 = undefined;
         const safe_name = sanitizeFilenameComponent(&name_buf, file_id, 200);
-        path_fbs.writer().print("{s}/nullclaw_doc_{s}{s}", .{ tmp_dir, safe_name, ext }) catch return null;
+        const tmp_base = trimTrailingPathSeparators(tmp_dir);
+        path_fbs.writer().print("{s}{s}nullclaw_doc_{s}{s}", .{ tmp_base, pathSeparator(tmp_base), safe_name, ext }) catch return null;
     }
     const local_path = path_fbs.getWritten();
 
@@ -2499,6 +2553,21 @@ test "telegram sanitizeFilenameComponent avoids Windows reserved names" {
     try std.testing.expectEqualStrings("_LPT1.txt", lpt_name);
 }
 
+test "telegram trimTrailingPathSeparators removes trailing slash from tmpdir" {
+    const trimmed = trimTrailingPathSeparators("/var/folders/a/b/T/");
+    try std.testing.expectEqualStrings("/var/folders/a/b/T", trimmed);
+}
+
+test "telegram trimTrailingPathSeparators keeps root slash" {
+    const trimmed = trimTrailingPathSeparators("/");
+    try std.testing.expectEqualStrings("/", trimmed);
+}
+
+test "telegram pathSeparator avoids duplicate slash" {
+    try std.testing.expectEqualStrings("/", pathSeparator("/var/folders/a/b/T"));
+    try std.testing.expectEqualStrings("", pathSeparator("/var/folders/a/b/T/"));
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Document Handling Tests
 // ════════════════════════════════════════════════════════════════════════════
@@ -2880,4 +2949,37 @@ test "telegram sweepTempMediaFilesInDir removes only stale nullclaw temp media f
 
     const photo_stat = tmp_dir.dir.statFile("nullclaw_photo_old.jpg");
     try std.testing.expectError(error.FileNotFound, photo_stat);
+}
+
+test "telegram resolveAttachmentPath expands tilde path" {
+    const allocator = std.testing.allocator;
+    const home = try platform.getHomeDir(allocator);
+    defer allocator.free(home);
+
+    const input = if (comptime builtin.os.tag == .windows) "~\\docs\\report.txt" else "~/docs/report.txt";
+    const suffix = if (comptime builtin.os.tag == .windows) "docs\\report.txt" else "docs/report.txt";
+    const expected = try std.fs.path.join(allocator, &.{ home, suffix });
+    defer allocator.free(expected);
+
+    const resolved = try TelegramChannel.resolveAttachmentPath(allocator, input);
+    defer resolved.deinit(allocator);
+
+    try std.testing.expect(resolved.owned != null);
+    try std.testing.expectEqualStrings(expected, resolved.path);
+}
+
+test "telegram resolveAttachmentPath keeps absolute local path unchanged" {
+    const allocator = std.testing.allocator;
+    const input = if (comptime builtin.os.tag == .windows) "C:\\tmp\\a.txt" else "/tmp/a.txt";
+
+    const resolved = try TelegramChannel.resolveAttachmentPath(allocator, input);
+    defer resolved.deinit(allocator);
+
+    try std.testing.expect(resolved.owned == null);
+    try std.testing.expectEqualStrings(input, resolved.path);
+}
+
+test "telegram bot command payload includes memory and doctor commands" {
+    try std.testing.expect(std.mem.indexOf(u8, TELEGRAM_BOT_COMMANDS_JSON, "\"command\":\"memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, TELEGRAM_BOT_COMMANDS_JSON, "\"command\":\"doctor\"") != null);
 }

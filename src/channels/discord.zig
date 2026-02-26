@@ -45,6 +45,10 @@ pub const DiscordChannel = struct {
     pub const GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
     const TYPING_INTERVAL_NS: u64 = 8 * std.time.ns_per_s;
     const TYPING_SLEEP_STEP_NS: u64 = 100 * std.time.ns_per_ms;
+    const InvalidSessionAction = enum {
+        identify,
+        resume_session,
+    };
 
     const TypingTask = struct {
         channel: *DiscordChannel,
@@ -417,13 +421,22 @@ pub const DiscordChannel = struct {
 
     fn gatewayLoop(self: *DiscordChannel) void {
         while (self.running.load(.acquire)) {
-            self.runGatewayOnce() catch |err| {
-                log.warn("Discord gateway error: {}", .{err});
+            var backoff_ms: u64 = 5000;
+            self.runGatewayOnce() catch |err| switch (err) {
+                error.ShouldReconnect => {
+                    // OP7 RECONNECT is a normal control signal from Discord.
+                    // Reconnect quickly to minimize missed events.
+                    log.info("Discord gateway reconnect requested by server", .{});
+                    backoff_ms = 250;
+                },
+                else => {
+                    log.warn("Discord gateway error: {}", .{err});
+                },
             };
             if (!self.running.load(.acquire)) break;
-            // 5 second backoff between reconnects (interruptible)
+            // Backoff between reconnects (interruptible).
             var slept: u64 = 0;
-            while (slept < 5000 and self.running.load(.acquire)) {
+            while (slept < backoff_ms and self.running.load(.acquire)) {
                 std.Thread.sleep(100 * std.time.ns_per_ms);
                 slept += 100;
             }
@@ -470,17 +483,21 @@ pub const DiscordChannel = struct {
         if (self.session_id != null) {
             try self.sendResumePayload(&ws);
         } else {
+            self.sequence.store(0, .release);
             try self.sendIdentifyPayload(&ws);
         }
 
         // Main read loop
         while (self.running.load(.acquire)) {
-            const maybe_text = ws.readTextMessage() catch break;
+            const maybe_text = ws.readTextMessage() catch |err| {
+                log.warn("Discord gateway read failed: {}", .{err});
+                break;
+            };
             const text = maybe_text orelse break;
             defer self.allocator.free(text);
             self.handleGatewayMessage(&ws, text) catch |err| {
+                if (err == error.ShouldReconnect) return err;
                 log.err("Discord gateway msg error: {}", .{err});
-                if (err == error.ShouldReconnect) break;
             };
         }
     }
@@ -580,9 +597,9 @@ pub const DiscordChannel = struct {
                 if (root_val.object.get("s")) |s_val| {
                     switch (s_val) {
                         .integer => |s| {
-                            if (s > self.sequence.load(.acquire)) {
-                                self.sequence.store(s, .release);
-                            }
+                            // Sequence comes from the active gateway session and is ordered.
+                            // Always overwrite to avoid stale seq after a fresh IDENTIFY.
+                            self.sequence.store(s, .release);
                         },
                         else => {},
                     }
@@ -627,29 +644,47 @@ pub const DiscordChannel = struct {
                     .bool => |b| b,
                     else => false,
                 } else false;
-
-                if (!resumable) {
-                    // Free session state — must re-identify
-                    if (self.session_id) |s| {
-                        self.allocator.free(s);
-                        self.session_id = null;
-                    }
-                    if (self.resume_gateway_url) |u| {
-                        self.allocator.free(u);
-                        self.resume_gateway_url = null;
-                    }
+                switch (self.resolveInvalidSessionAction(resumable)) {
+                    .resume_session => {
+                        self.sendResumePayload(ws) catch |err| {
+                            log.warn("Discord: resume after INVALID_SESSION failed: {}", .{err});
+                            return error.ShouldReconnect;
+                        };
+                    },
+                    .identify => {
+                        self.sendIdentifyPayload(ws) catch |err| {
+                            log.warn("Discord: re-identify after INVALID_SESSION failed: {}", .{err});
+                            return error.ShouldReconnect;
+                        };
+                    },
                 }
-
-                // Send IDENTIFY
-                self.sendIdentifyPayload(ws) catch |err| {
-                    log.warn("Discord: re-identify failed: {}", .{err});
-                    return error.ShouldReconnect;
-                };
             },
             else => {
                 log.warn("Discord: unhandled gateway op={d}", .{op});
             },
         }
+    }
+
+    fn clearSessionStateForIdentify(self: *DiscordChannel) void {
+        if (self.session_id) |s| {
+            self.allocator.free(s);
+            self.session_id = null;
+        }
+        if (self.resume_gateway_url) |u| {
+            self.allocator.free(u);
+            self.resume_gateway_url = null;
+        }
+        self.sequence.store(0, .release);
+    }
+
+    fn resolveInvalidSessionAction(self: *DiscordChannel, resumable: bool) InvalidSessionAction {
+        if (resumable and self.session_id != null) {
+            return .resume_session;
+        }
+        // Either explicitly non-resumable OR resumable but local session state is absent.
+        // In both cases fall back to a clean IDENTIFY path.
+        self.clearSessionStateForIdentify();
+        return .identify;
     }
 
     /// Handle READY event: extract session_id, resume_gateway_url, bot_user_id.
@@ -1196,6 +1231,68 @@ test "discord handleMessageCreate require_mention blocks unmentioned guild messa
 
     try ch.handleMessageCreate(parsed.value);
     try std.testing.expectEqual(@as(usize, 0), event_bus.inboundDepth());
+}
+
+test "discord dispatch sequence accepts lower values after session reset" {
+    var ch = DiscordChannel.init(std.testing.allocator, "token", null, false);
+    defer {
+        if (ch.session_id) |s| std.testing.allocator.free(s);
+        if (ch.resume_gateway_url) |u| std.testing.allocator.free(u);
+        if (ch.bot_user_id) |u| std.testing.allocator.free(u);
+    }
+
+    // Simulate stale sequence from an old session.
+    ch.sequence.store(42, .release);
+
+    var ws_dummy: websocket.WsClient = undefined;
+    const ready_dispatch =
+        \\{"op":0,"s":1,"t":"READY","d":{"session_id":"sess-1","resume_gateway_url":"wss://gateway.discord.gg/?v=10&encoding=json","user":{"id":"bot-1"}}}
+    ;
+    try ch.handleGatewayMessage(&ws_dummy, ready_dispatch);
+
+    try std.testing.expectEqual(@as(i64, 1), ch.sequence.load(.acquire));
+}
+
+test "discord invalid session non-resumable clears state and identifies" {
+    const alloc = std.testing.allocator;
+    var ch = DiscordChannel.init(alloc, "token", null, false);
+    ch.session_id = try alloc.dupe(u8, "sess-1");
+    ch.resume_gateway_url = try alloc.dupe(u8, "wss://gateway.discord.gg/?v=10&encoding=json");
+    ch.sequence.store(77, .release);
+
+    const action = ch.resolveInvalidSessionAction(false);
+    try std.testing.expectEqual(DiscordChannel.InvalidSessionAction.identify, action);
+    try std.testing.expect(ch.session_id == null);
+    try std.testing.expect(ch.resume_gateway_url == null);
+    try std.testing.expectEqual(@as(i64, 0), ch.sequence.load(.acquire));
+}
+
+test "discord invalid session resumable keeps state and resumes" {
+    const alloc = std.testing.allocator;
+    var ch = DiscordChannel.init(alloc, "token", null, false);
+    ch.session_id = try alloc.dupe(u8, "sess-2");
+    defer {
+        if (ch.session_id) |s| alloc.free(s);
+    }
+    ch.sequence.store(123, .release);
+
+    const action = ch.resolveInvalidSessionAction(true);
+    try std.testing.expectEqual(DiscordChannel.InvalidSessionAction.resume_session, action);
+    try std.testing.expect(ch.session_id != null);
+    try std.testing.expectEqual(@as(i64, 123), ch.sequence.load(.acquire));
+}
+
+test "discord invalid session resumable without session falls back to identify" {
+    const alloc = std.testing.allocator;
+    var ch = DiscordChannel.init(alloc, "token", null, false);
+    ch.resume_gateway_url = try alloc.dupe(u8, "wss://gateway.discord.gg/?v=10&encoding=json");
+    ch.sequence.store(33, .release);
+
+    const action = ch.resolveInvalidSessionAction(true);
+    try std.testing.expectEqual(DiscordChannel.InvalidSessionAction.identify, action);
+    try std.testing.expect(ch.session_id == null);
+    try std.testing.expect(ch.resume_gateway_url == null);
+    try std.testing.expectEqual(@as(i64, 0), ch.sequence.load(.acquire));
 }
 
 test "discord intent bitmask guilds" {

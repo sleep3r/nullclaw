@@ -7,8 +7,10 @@
 //!   - Prunes old conversation rows from SQLite
 
 const std = @import("std");
-const root = @import("root.zig");
+const build_options = @import("build_options");
+const root = @import("../root.zig");
 const Memory = root.Memory;
+const sqlite_mod = if (build_options.enable_sqlite) @import("../engines/sqlite.zig") else @import("../engines/sqlite_disabled.zig");
 
 /// Default hygiene interval in seconds (12 hours).
 const HYGIENE_INTERVAL_SECS: i64 = 12 * 60 * 60;
@@ -134,7 +136,9 @@ fn archiveOldFiles(allocator: std.mem.Allocator, config: HygieneConfig) !u64 {
 
         std.fs.cwd().rename(src_path, dst_path) catch {
             // Fallback: try copy + delete
-            memory_dir.copyFile(name, std.fs.cwd().openDir(archive_path, .{}) catch continue, name, .{}) catch continue;
+            var dest_dir = std.fs.cwd().openDir(archive_path, .{}) catch continue;
+            defer dest_dir.close();
+            memory_dir.copyFile(name, dest_dir, name, .{}) catch continue;
             memory_dir.deleteFile(name) catch {};
         };
         moved += 1;
@@ -176,11 +180,11 @@ pub fn pruneConversationRows(allocator: std.mem.Allocator, mem: Memory, retentio
 
     // Search for conversation-tagged entries
     const results = mem.search(allocator, "conversation", 1000) catch return 0;
-    if (results.len == 0) return 0;
     defer {
         for (results) |r| r.deinit(allocator);
         allocator.free(results);
     }
+    if (results.len == 0) return 0;
 
     var pruned: u64 = 0;
     for (results) |entry| {
@@ -256,4 +260,35 @@ test "parseConversationTimestamp invalid prefix" {
 
 test "parseConversationTimestamp no timestamp" {
     try std.testing.expect(parseConversationTimestamp("conv_notanumber_abc") == null);
+}
+
+// ── R3 Tests ──────────────────────────────────────────────────────
+
+test "R3: pruneConversationRows with empty NoneMemory returns 0" {
+    var none_mem = root.NoneMemory.init();
+    defer none_mem.deinit();
+    const mem = none_mem.memory();
+
+    const pruned = try pruneConversationRows(std.testing.allocator, mem, 30);
+    try std.testing.expectEqual(@as(u64, 0), pruned);
+}
+
+test "R3: pruneConversationRows with sqlite empty store returns 0" {
+    if (!build_options.enable_sqlite) return;
+
+    var mem_impl = try sqlite_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem_impl.deinit();
+    const mem = mem_impl.memory();
+
+    const pruned = try pruneConversationRows(std.testing.allocator, mem, 30);
+    try std.testing.expectEqual(@as(u64, 0), pruned);
+}
+
+test "R3: parseConversationTimestamp key with only prefix" {
+    try std.testing.expect(parseConversationTimestamp("conv_") == null);
+}
+
+test "R3: parseConversationTimestamp key without trailing id" {
+    const ts = parseConversationTimestamp("conv_1700000000");
+    try std.testing.expectEqual(@as(i64, 1700000000), ts.?);
 }

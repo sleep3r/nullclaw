@@ -18,6 +18,7 @@ const channel_manager = @import("channel_manager.zig");
 const agent_routing = @import("agent_routing.zig");
 const channel_catalog = @import("channel_catalog.zig");
 const channel_adapters = @import("channel_adapters.zig");
+const onboard = @import("onboard.zig");
 
 const log = std.log.scoped(.daemon);
 
@@ -654,11 +655,15 @@ fn inboundDispatcherThread(
     }
 }
 
-/// Run the daemon. This is the main entry point for `nullclaw daemon`.
+/// Run the long-lived runtime. This is the main entry point for `nullclaw gateway`.
 /// Spawns threads for gateway, heartbeat, and channels, then loops until
 /// shutdown is requested (Ctrl+C signal or explicit request).
 /// `host` and `port` are CLI-parsed values that override `config.gateway`.
 pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8, port: u16) !void {
+    // Ensure lifecycle parity: workspace bootstrap files must exist
+    // even when users skip onboard and start runtime directly.
+    try onboard.scaffoldWorkspace(allocator, config.workspace_dir, &onboard.ProjectContext{});
+
     health.markComponentOk("daemon");
     shutdown_requested.store(false, .release);
     const has_supervised_channels = hasSupervisedChannels(config);
@@ -686,7 +691,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var stdout_buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&stdout_buf);
     const stdout = &bw.interface;
-    try stdout.print("nullclaw daemon started\n", .{});
+    try stdout.print("nullclaw gateway runtime started\n", .{});
     try stdout.print("  Gateway:  http://{s}:{d}\n", .{ state.gateway_host, state.gateway_port });
     try stdout.print("  Components: {d} active\n", .{state.component_count});
     try stdout.flush();
@@ -821,7 +826,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     if (hb_thread) |t| t.join();
     gw_thread.join();
 
-    try stdout.print("nullclaw daemon stopped.\n", .{});
+    try stdout.print("nullclaw gateway runtime stopped.\n", .{});
 }
 
 // ── Tests ────────────────────────────────────────────────────────

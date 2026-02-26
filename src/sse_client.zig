@@ -32,6 +32,9 @@ pub const SseConnection = struct {
     url: []const u8,
     /// Buffer for reading response data
     transfer_buf: [4096]u8,
+    /// Last received event ID for reconnection (W3C SSE spec).
+    /// Sent as Last-Event-ID header on reconnect so the server can resume.
+    last_event_id: ?[]const u8 = null,
 
     pub const Error = error{
         NotConnected,
@@ -63,6 +66,14 @@ pub const SseConnection = struct {
         }
         // Deinit client (closes any remaining connections).
         self.client.deinit();
+        if (self.last_event_id) |id| self.allocator.free(id);
+        self.last_event_id = null;
+    }
+
+    /// Update the stored last event ID (takes ownership via dupe).
+    pub fn setLastEventId(self: *SseConnection, id: []const u8) void {
+        if (self.last_event_id) |old| self.allocator.free(old);
+        self.last_event_id = self.allocator.dupe(u8, id) catch null;
     }
 
     /// Connect to SSE endpoint and start streaming
@@ -72,11 +83,18 @@ pub const SseConnection = struct {
         const uri = try std.Uri.parse(self.url);
         self.body_reader = null;
 
-        // Build request options with SSE headers
-        const extra_headers = [_]std.http.Header{
-            .{ .name = "Accept", .value = "text/event-stream" },
-        };
-        const options: std.http.Client.RequestOptions = .{ .extra_headers = &extra_headers };
+        // Build request options with SSE headers.
+        // Per W3C SSE spec, send Last-Event-ID on reconnection so the server
+        // can replay missed events.
+        var extra_headers_buf: [2]std.http.Header = undefined;
+        var n_headers: usize = 0;
+        extra_headers_buf[n_headers] = .{ .name = "Accept", .value = "text/event-stream" };
+        n_headers += 1;
+        if (self.last_event_id) |id| {
+            extra_headers_buf[n_headers] = .{ .name = "Last-Event-ID", .value = id };
+            n_headers += 1;
+        }
+        const options: std.http.Client.RequestOptions = .{ .extra_headers = extra_headers_buf[0..n_headers] };
 
         // Replace any previous request before opening a new stream.
         if (self.request) |*req| {
@@ -231,11 +249,31 @@ pub const SseConnection = struct {
 /// SSE event data structure
 pub const SseEvent = struct {
     data: []const u8,
+    /// Event type from the "event:" field (empty string means default "message").
+    /// Owned by the caller; freed on deinit.
+    event_type: []const u8 = "",
+    /// Last event ID from the "id:" field (empty string if not set).
+    /// Owned by the caller; freed on deinit.
+    id: []const u8 = "",
 
     pub fn deinit(self: *SseEvent, allocator: std.mem.Allocator) void {
+        if (self.event_type.len > 0) allocator.free(self.event_type);
+        if (self.id.len > 0) allocator.free(self.id);
         allocator.free(self.data);
     }
 };
+
+/// Helper to transfer ownership of an ArrayList(u8) to a caller-owned slice,
+/// or free the backing capacity if items are empty. Returns &.{} when empty.
+fn ownOrFreeList(list: *std.ArrayList(u8), allocator: std.mem.Allocator) ![]u8 {
+    if (list.items.len > 0) {
+        return try list.toOwnedSlice(allocator);
+    } else {
+        // Free any retained capacity (e.g. from clearRetainingCapacity)
+        list.deinit(allocator);
+        return @as([]u8, &.{});
+    }
+}
 
 /// Parse SSE events from a buffer
 /// Returns a slice of events (caller must free each event.data and the slice itself)
@@ -243,6 +281,12 @@ pub const SseEvent = struct {
 /// Safety: Truncates events larger than MAX_EVENT_SIZE to prevent memory exhaustion.
 /// Events are delimited by double newlines (\n\n).
 /// Each data: line contributes to the event data, with newlines preserved.
+///
+/// Per the W3C SSE specification:
+/// - Lines starting with ":" are comments (ignored)
+/// - Field names: "data", "event", "id", "retry"
+/// - After "field:", exactly ONE leading space is stripped from the value
+/// - Empty data: lines append an empty string (producing a newline in multi-line data)
 pub fn parseEvents(allocator: std.mem.Allocator, buffer: []const u8) ![]SseEvent {
     var events: std.ArrayList(SseEvent) = .{};
     defer events.deinit(allocator);
@@ -250,61 +294,148 @@ pub fn parseEvents(allocator: std.mem.Allocator, buffer: []const u8) ![]SseEvent
     var current_data: std.ArrayList(u8) = .{};
     defer current_data.deinit(allocator);
 
+    var current_event_type: std.ArrayList(u8) = .{};
+    defer current_event_type.deinit(allocator);
+
+    var current_id: std.ArrayList(u8) = .{};
+    defer current_id.deinit(allocator);
+
     var total_event_size: usize = 0;
+    var has_data: bool = false;
 
     var lines = std.mem.splitScalar(u8, buffer, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \r");
+    while (lines.next()) |raw_line| {
+        // Strip trailing CR for CRLF line endings
+        const line = std.mem.trimRight(u8, raw_line, "\r");
 
-        if (trimmed.len == 0) {
-            // Empty line marks end of event
-            if (current_data.items.len > 0) {
+        if (line.len == 0) {
+            // Empty line marks end of event — dispatch if we have data
+            if (has_data) {
                 const data = try current_data.toOwnedSlice(allocator);
-                try events.append(allocator, .{ .data = data });
+                errdefer allocator.free(data);
+
+                const event_type = try ownOrFreeList(&current_event_type, allocator);
+                const id = try ownOrFreeList(&current_id, allocator);
+
+                try events.append(allocator, .{
+                    .data = data,
+                    .event_type = event_type,
+                    .id = id,
+                });
+
                 current_data = .{};
+                current_event_type = .{};
+                current_id = .{};
                 total_event_size = 0;
+                has_data = false;
             }
             continue;
         }
 
         // Skip comments (lines starting with :)
-        if (trimmed[0] == ':') continue;
+        if (line[0] == ':') continue;
 
-        // Parse data field
-        if (std.mem.startsWith(u8, trimmed, "data:")) {
-            const data_start = 5; // Skip "data:"
-            const data = std.mem.trim(u8, trimmed[data_start..], " ");
+        // Parse field: value (per SSE spec, strip exactly one leading space from value)
+        const field_and_value = parseField(line);
+        const field = field_and_value.field;
+        const value = field_and_value.value;
 
+        if (std.mem.eql(u8, field, "data")) {
             // Check event size limit before appending
-            const newline_len: usize = if (current_data.items.len > 0) 1 else 0;
-            const new_size = total_event_size + data.len + newline_len;
+            const newline_len: usize = if (has_data) 1 else 0;
+            const new_size = total_event_size + value.len + newline_len;
             if (new_size > MAX_EVENT_SIZE) {
-                // Event too large - finalize current event and skip remaining data
-                if (current_data.items.len > 0) {
+                // Event too large - finalize current event and skip remaining data.
+                // Include event_type/id so the caller can still identify the truncated event.
+                if (has_data) {
                     const owned = try current_data.toOwnedSlice(allocator);
-                    try events.append(allocator, .{ .data = owned });
+                    errdefer allocator.free(owned);
+
+                    const etype = try ownOrFreeList(&current_event_type, allocator);
+                    const eid = try ownOrFreeList(&current_id, allocator);
+
+                    try events.append(allocator, .{
+                        .data = owned,
+                        .event_type = etype,
+                        .id = eid,
+                    });
+                } else {
+                    // No data yet but event_type/id may have backing allocations
+                    current_event_type.deinit(allocator);
+                    current_id.deinit(allocator);
                 }
                 current_data = .{};
+                current_event_type = .{};
+                current_id = .{};
                 total_event_size = 0;
+                has_data = false;
                 continue;
             }
 
-            if (current_data.items.len > 0) {
+            if (has_data) {
                 try current_data.append(allocator, '\n');
             }
-            try current_data.appendSlice(allocator, data);
+            try current_data.appendSlice(allocator, value);
             total_event_size = new_size;
+            has_data = true;
+        } else if (std.mem.eql(u8, field, "event")) {
+            current_event_type.clearRetainingCapacity();
+            try current_event_type.appendSlice(allocator, value);
+        } else if (std.mem.eql(u8, field, "id")) {
+            // Per spec, id field must not contain null (U+0000)
+            if (std.mem.indexOfScalar(u8, value, 0) == null) {
+                current_id.clearRetainingCapacity();
+                try current_id.appendSlice(allocator, value);
+            }
+        } else if (std.mem.eql(u8, field, "retry")) {
+            // retry: <integer> — reconnection time in milliseconds
+            // We parse it but don't act on it (caller should handle via returned events)
+            _ = std.fmt.parseInt(u64, value, 10) catch {};
         }
-        // Could also handle id: and event: fields here if needed
+        // Unknown fields are ignored per spec
     }
 
     // Handle any remaining data without trailing newline
-    if (current_data.items.len > 0) {
+    if (has_data) {
         const data = try current_data.toOwnedSlice(allocator);
-        try events.append(allocator, .{ .data = data });
+        errdefer allocator.free(data);
+
+        const event_type = try ownOrFreeList(&current_event_type, allocator);
+        const id = try ownOrFreeList(&current_id, allocator);
+
+        try events.append(allocator, .{
+            .data = data,
+            .event_type = event_type,
+            .id = id,
+        });
+        // Mark as consumed so the defers don't double-free
+        current_data = .{};
+        current_event_type = .{};
+        current_id = .{};
     }
 
     return try events.toOwnedSlice(allocator);
+}
+
+/// Parse a single SSE line into field name and value.
+/// Per the W3C spec: if the line contains ":", the field is everything before the first ":"
+/// and the value is everything after, with exactly one leading space stripped if present.
+/// If the line contains no ":", the entire line is the field name and value is empty.
+fn parseField(line: []const u8) struct { field: []const u8, value: []const u8 } {
+    if (std.mem.indexOfScalar(u8, line, ':')) |colon_pos| {
+        const field = line[0..colon_pos];
+        const rest = line[colon_pos + 1 ..];
+        // Strip exactly one leading space (per SSE spec)
+        const value = if (rest.len > 0 and rest[0] == ' ') rest[1..] else rest;
+        return .{ .field = field, .value = value };
+    }
+    // No colon — entire line is field name, value is empty string
+    return .{ .field = line, .value = "" };
+}
+
+fn freeEvents(allocator: std.mem.Allocator, events: []SseEvent) void {
+    for (events) |*e| e.deinit(allocator);
+    allocator.free(events);
 }
 
 test "parseEvents extracts SSE data fields" {
@@ -313,10 +444,7 @@ test "parseEvents extracts SSE data fields" {
     // Test basic SSE format: data: json\n\n
     const sse_data = "data: {\"message\":\"hello\"}\n\ndata: {\"message\":\"world\"}\n\n";
     const events = try parseEvents(allocator, sse_data);
-    defer {
-        for (events) |*e| e.deinit(allocator);
-        allocator.free(events);
-    }
+    defer freeEvents(allocator, events);
 
     try std.testing.expectEqual(@as(usize, 2), events.len);
     try std.testing.expectEqualStrings("{\"message\":\"hello\"}", events[0].data);
@@ -328,10 +456,7 @@ test "parseEvents skips comments" {
 
     const sse_data = ": comment\ndata: {\"msg\":\"test\"}\n\n";
     const events = try parseEvents(allocator, sse_data);
-    defer {
-        for (events) |*e| e.deinit(allocator);
-        allocator.free(events);
-    }
+    defer freeEvents(allocator, events);
 
     try std.testing.expectEqual(@as(usize, 1), events.len);
     try std.testing.expectEqualStrings("{\"msg\":\"test\"}", events[0].data);
@@ -343,11 +468,78 @@ test "parseEvents handles multi-line data" {
     // Multi-line data should have newlines preserved
     const sse_data = "data: line1\ndata: line2\n\n";
     const events = try parseEvents(allocator, sse_data);
-    defer {
-        for (events) |*e| e.deinit(allocator);
-        allocator.free(events);
-    }
+    defer freeEvents(allocator, events);
 
     try std.testing.expectEqual(@as(usize, 1), events.len);
     try std.testing.expectEqualStrings("line1\nline2", events[0].data);
+}
+
+test "parseEvents parses event type and id fields" {
+    const allocator = std.testing.allocator;
+
+    const sse_data = "event: update\nid: 42\ndata: payload\n\n";
+    const events = try parseEvents(allocator, sse_data);
+    defer freeEvents(allocator, events);
+
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("payload", events[0].data);
+    try std.testing.expectEqualStrings("update", events[0].event_type);
+    try std.testing.expectEqualStrings("42", events[0].id);
+}
+
+test "parseEvents strips exactly one leading space from value" {
+    const allocator = std.testing.allocator;
+
+    // "data:  two spaces" should produce " two spaces" (one space stripped)
+    const sse_data = "data:  two spaces\n\n";
+    const events = try parseEvents(allocator, sse_data);
+    defer freeEvents(allocator, events);
+
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings(" two spaces", events[0].data);
+}
+
+test "parseEvents handles data field with no value" {
+    const allocator = std.testing.allocator;
+
+    // "data:" followed by "data: content" should produce "\ncontent"
+    const sse_data = "data:\ndata: content\n\n";
+    const events = try parseEvents(allocator, sse_data);
+    defer freeEvents(allocator, events);
+
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("\ncontent", events[0].data);
+}
+
+test "parseEvents handles CRLF line endings" {
+    const allocator = std.testing.allocator;
+
+    const sse_data = "data: hello\r\n\r\n";
+    const events = try parseEvents(allocator, sse_data);
+    defer freeEvents(allocator, events);
+
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("hello", events[0].data);
+}
+
+test "parseField parses field:value correctly" {
+    // Normal field with space
+    const r1 = parseField("data: hello");
+    try std.testing.expectEqualStrings("data", r1.field);
+    try std.testing.expectEqualStrings("hello", r1.value);
+
+    // No space after colon
+    const r2 = parseField("data:hello");
+    try std.testing.expectEqualStrings("data", r2.field);
+    try std.testing.expectEqualStrings("hello", r2.value);
+
+    // No colon — entire line is field name
+    const r3 = parseField("data");
+    try std.testing.expectEqualStrings("data", r3.field);
+    try std.testing.expectEqualStrings("", r3.value);
+
+    // Empty value after colon
+    const r4 = parseField("data:");
+    try std.testing.expectEqualStrings("data", r4.field);
+    try std.testing.expectEqualStrings("", r4.value);
 }

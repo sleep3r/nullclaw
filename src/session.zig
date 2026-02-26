@@ -51,6 +51,9 @@ pub const SessionManager = struct {
     provider: Provider,
     tools: []const Tool,
     mem: ?Memory,
+    session_store: ?memory_mod.SessionStore = null,
+    response_cache: ?*memory_mod.cache.ResponseCache = null,
+    mem_rt: ?*memory_mod.MemoryRuntime = null,
     observer: Observer,
     policy: ?*const SecurityPolicy = null,
 
@@ -64,6 +67,8 @@ pub const SessionManager = struct {
         tools: []const Tool,
         mem: ?Memory,
         observer_i: Observer,
+        session_store: ?memory_mod.SessionStore,
+        response_cache: ?*memory_mod.cache.ResponseCache,
     ) SessionManager {
         tools_mod.bindMemoryTools(tools, mem);
 
@@ -73,6 +78,8 @@ pub const SessionManager = struct {
             .provider = provider,
             .tools = tools,
             .mem = mem,
+            .session_store = session_store,
+            .response_cache = response_cache,
             .observer = observer_i,
             .mutex = .{},
             .sessions = .{},
@@ -114,6 +121,9 @@ pub const SessionManager = struct {
             self.observer,
         );
         agent.policy = self.policy;
+        agent.session_store = self.session_store;
+        agent.response_cache = self.response_cache;
+        agent.mem_rt = self.mem_rt;
         agent.memory_session_id = owned_key;
 
         session.* = .{
@@ -125,19 +135,19 @@ pub const SessionManager = struct {
             .turn_count = 0,
             .mutex = .{},
         };
+        // From here, session owns agent — must deinit on error.
+        errdefer session.agent.deinit();
 
-        // Restore persisted conversation history from SQLite
-        if (self.mem) |mem| {
-            if (mem.asSqlite()) |sqlite_mem| {
-                const entries = sqlite_mem.loadMessages(self.allocator, session_key) catch &.{};
-                if (entries.len > 0) {
-                    session.agent.loadHistory(entries) catch {};
-                    for (entries) |entry| {
-                        self.allocator.free(entry.role);
-                        self.allocator.free(entry.content);
-                    }
-                    self.allocator.free(entries);
+        // Restore persisted conversation history from session store
+        if (self.session_store) |store| {
+            const entries = store.loadMessages(self.allocator, session_key) catch &.{};
+            if (entries.len > 0) {
+                session.agent.loadHistory(entries) catch {};
+                for (entries) |entry| {
+                    self.allocator.free(entry.role);
+                    self.allocator.free(entry.content);
                 }
+                self.allocator.free(entries);
             }
         }
 
@@ -183,20 +193,18 @@ pub const SessionManager = struct {
             session.last_consolidated = @intCast(@max(0, std.time.timestamp()));
         }
 
-        // Persist messages to SQLite
-        if (self.mem) |mem| {
-            if (mem.asSqlite()) |sqlite_mem| {
-                const trimmed = std.mem.trim(u8, content, " \t\r\n");
-                if (slashClearsSession(trimmed)) {
-                    // Clear persisted messages on session reset
-                    sqlite_mem.clearMessages(session_key) catch {};
-                    // Clear stale auto-saved memories
-                    sqlite_mem.clearAutoSaved(session_key) catch {};
-                } else if (!std.mem.startsWith(u8, trimmed, "/")) {
-                    // Persist user + assistant messages (skip slash commands)
-                    sqlite_mem.saveMessage(session_key, "user", content) catch {};
-                    sqlite_mem.saveMessage(session_key, "assistant", response) catch {};
-                }
+        // Persist messages via session store
+        if (self.session_store) |store| {
+            const trimmed = std.mem.trim(u8, content, " \t\r\n");
+            if (slashClearsSession(trimmed)) {
+                // Clear persisted messages on session reset
+                store.clearMessages(session_key) catch {};
+                // Clear stale auto-saved memories
+                store.clearAutoSaved(session_key) catch {};
+            } else if (!std.mem.startsWith(u8, trimmed, "/")) {
+                // Persist user + assistant messages (skip slash commands)
+                store.saveMessage(session_key, "user", content) catch {};
+                store.saveMessage(session_key, "assistant", response) catch {};
             }
         }
 
@@ -305,10 +313,10 @@ const MockProvider = struct {
 
 /// Create a test SessionManager with mock provider.
 fn testSessionManager(allocator: Allocator, mock: *MockProvider, cfg: *const Config) SessionManager {
-    return testSessionManagerWithMemory(allocator, mock, cfg, null);
+    return testSessionManagerWithMemory(allocator, mock, cfg, null, null);
 }
 
-fn testSessionManagerWithMemory(allocator: Allocator, mock: *MockProvider, cfg: *const Config, mem: ?Memory) SessionManager {
+fn testSessionManagerWithMemory(allocator: Allocator, mock: *MockProvider, cfg: *const Config, mem: ?Memory, session_store: ?memory_mod.SessionStore) SessionManager {
     var noop = observability.NoopObserver{};
     return SessionManager.init(
         allocator,
@@ -317,6 +325,8 @@ fn testSessionManagerWithMemory(allocator: Allocator, mock: *MockProvider, cfg: 
         &.{},
         mem,
         noop.observer(),
+        session_store,
+        null,
     );
 }
 
@@ -507,6 +517,8 @@ test "processMessage /new clears autosave only for current session" {
         &.{},
         mem,
         noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
     );
     defer sm.deinit();
 
@@ -544,6 +556,8 @@ test "processMessage /new with model clears autosave only for current session" {
         &.{},
         mem,
         noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
     );
     defer sm.deinit();
 
@@ -580,6 +594,8 @@ test "processMessage /reset clears autosave only for current session" {
         &.{},
         mem,
         noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
     );
     defer sm.deinit();
 
@@ -616,6 +632,8 @@ test "processMessage /restart clears autosave only for current session" {
         &.{},
         mem,
         noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
     );
     defer sm.deinit();
 
@@ -646,7 +664,7 @@ test "processMessage with sqlite memory first turn does not panic" {
     defer sqlite_mem.deinit();
     const mem = sqlite_mem.memory();
 
-    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, mem);
+    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, mem, sqlite_mem.sessionStore());
     defer sm.deinit();
 
     const resp = try sm.processMessage("signal:session:1", "hello");
@@ -827,7 +845,7 @@ test "concurrent processMessage with sqlite memory does not panic" {
     defer sqlite_mem.deinit();
     const mem = sqlite_mem.memory();
 
-    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, mem);
+    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, mem, sqlite_mem.sessionStore());
     defer sm.deinit();
 
     const num_threads = 4;

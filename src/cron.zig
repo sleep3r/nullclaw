@@ -1,6 +1,7 @@
 const std = @import("std");
 const platform = @import("platform.zig");
 const bus = @import("bus.zig");
+const json_util = @import("json_util.zig");
 
 const log = std.log.scoped(.cron);
 
@@ -904,40 +905,49 @@ pub fn saveJobs(scheduler: *const CronScheduler) !void {
     const path = try cronJsonPath(scheduler.allocator);
     defer scheduler.allocator.free(path);
 
-    const file = try std.fs.createFileAbsolute(path, .{});
-    defer file.close();
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(scheduler.allocator);
 
-    var buf: [8192]u8 = undefined;
-    var bw = file.writer(&buf);
-    const w = &bw.interface;
-
-    try w.writeAll("[\n");
+    try buf.appendSlice(scheduler.allocator, "[\n");
     for (scheduler.jobs.items, 0..) |job, i| {
-        try w.writeAll("  {");
-        try w.print("\"id\":\"{s}\",", .{job.id});
-        try w.print("\"expression\":\"{s}\",", .{job.expression});
-        try w.print("\"command\":\"{s}\",", .{job.command});
-        try w.print("\"next_run_secs\":{d},", .{job.next_run_secs});
+        if (i > 0) try buf.appendSlice(scheduler.allocator, ",\n");
+        try buf.appendSlice(scheduler.allocator, "  {");
+
+        try json_util.appendJsonKeyValue(&buf, scheduler.allocator, "id", job.id);
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, scheduler.allocator, "expression", job.expression);
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, scheduler.allocator, "command", job.command);
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonInt(&buf, scheduler.allocator, "next_run_secs", job.next_run_secs);
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKey(&buf, scheduler.allocator, "last_run_secs");
         if (job.last_run_secs) |lrs| {
-            try w.print("\"last_run_secs\":{d},", .{lrs});
+            var int_buf: [24]u8 = undefined;
+            const text = std.fmt.bufPrint(&int_buf, "{d}", .{lrs}) catch unreachable;
+            try buf.appendSlice(scheduler.allocator, text);
         } else {
-            try w.writeAll("\"last_run_secs\":null,");
+            try buf.appendSlice(scheduler.allocator, "null");
         }
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKey(&buf, scheduler.allocator, "last_status");
         if (job.last_status) |ls| {
-            try w.print("\"last_status\":\"{s}\",", .{ls});
+            try json_util.appendJsonString(&buf, scheduler.allocator, ls);
         } else {
-            try w.writeAll("\"last_status\":null,");
+            try buf.appendSlice(scheduler.allocator, "null");
         }
-        try w.print("\"paused\":{s},", .{if (job.paused) "true" else "false"});
-        try w.print("\"one_shot\":{s}", .{if (job.one_shot) "true" else "false"});
-        try w.writeAll("}");
-        if (i + 1 < scheduler.jobs.items.len) {
-            try w.writeAll(",");
-        }
-        try w.writeAll("\n");
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKey(&buf, scheduler.allocator, "paused");
+        try buf.appendSlice(scheduler.allocator, if (job.paused) "true" else "false");
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKey(&buf, scheduler.allocator, "one_shot");
+        try buf.appendSlice(scheduler.allocator, if (job.one_shot) "true" else "false");
+
+        try buf.appendSlice(scheduler.allocator, "}");
     }
-    try w.writeAll("]\n");
-    try w.flush();
+    try buf.appendSlice(scheduler.allocator, "\n]\n");
+
+    try writeFileAtomic(scheduler.allocator, path, buf.items);
 }
 
 /// Load jobs from ~/.nullclaw/cron.json into the scheduler.
@@ -955,8 +965,43 @@ pub fn loadJobsStrict(scheduler: *CronScheduler) !void {
 pub fn reloadJobs(scheduler: *CronScheduler) !void {
     var loaded = CronScheduler.init(scheduler.allocator, scheduler.max_tasks, scheduler.enabled);
     defer loaded.deinit();
-    try loadJobsStrict(&loaded);
+    loadJobsStrict(&loaded) catch |err| {
+        if (isRecoverableCronStoreError(err)) {
+            // Heal malformed/truncated cron.json by persisting current in-memory jobs.
+            // This prevents endless reload warnings after upgrades or interrupted writes.
+            try saveJobs(scheduler);
+            return;
+        }
+        return err;
+    };
     std.mem.swap(std.ArrayListUnmanaged(CronJob), &scheduler.jobs, &loaded.jobs);
+}
+
+fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp_path);
+
+    const tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
+    errdefer tmp_file.close();
+    try tmp_file.writeAll(data);
+    tmp_file.close();
+
+    std.fs.renameAbsolute(tmp_path, path) catch {
+        std.fs.deleteFileAbsolute(tmp_path) catch {};
+        const file = try std.fs.createFileAbsolute(path, .{});
+        defer file.close();
+        try file.writeAll(data);
+    };
+}
+
+fn isRecoverableCronStoreError(err: anyerror) bool {
+    return switch (err) {
+        error.UnexpectedEndOfInput,
+        error.SyntaxError,
+        error.InvalidCronStoreFormat,
+        => true,
+        else => false,
+    };
 }
 
 // ── CLI entry points (called from main.zig) ──────────────────────
@@ -1291,7 +1336,7 @@ test "save and load roundtrip" {
     try std.testing.expect(loaded[1].one_shot);
 }
 
-test "reloadJobs keeps existing jobs when store becomes invalid" {
+test "reloadJobs auto-recovers malformed store and keeps runtime jobs" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
     _ = try scheduler.addJob("*/10 * * * *", "echo keep");
@@ -1308,15 +1353,30 @@ test "reloadJobs keeps existing jobs when store becomes invalid" {
     defer bad_file.close();
     try bad_file.writeAll("{bad-json");
 
-    var reload_failed = false;
-    reloadJobs(&runtime) catch {
-        reload_failed = true;
-    };
-    try std.testing.expect(reload_failed);
+    try reloadJobs(&runtime);
     try std.testing.expectEqual(@as(usize, 1), runtime.listJobs().len);
 
-    // Restore valid store for subsequent tests.
-    try saveJobs(&runtime);
+    // Store should be healed and parseable again.
+    var healed = CronScheduler.init(std.testing.allocator, 10, true);
+    defer healed.deinit();
+    try loadJobsStrict(&healed);
+    try std.testing.expectEqual(@as(usize, 1), healed.listJobs().len);
+}
+
+test "save and load roundtrip with JSON-sensitive command characters" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const cmd = "printf \"line1\\nline2\" && echo \\\"ok\\\"";
+    _ = try scheduler.addJob("*/5 * * * *", cmd);
+
+    try saveJobs(&scheduler);
+
+    var loaded = CronScheduler.init(std.testing.allocator, 10, true);
+    defer loaded.deinit();
+    try loadJobsStrict(&loaded);
+    try std.testing.expectEqual(@as(usize, 1), loaded.listJobs().len);
+    try std.testing.expectEqualStrings(cmd, loaded.listJobs()[0].command);
 }
 
 test "JobType parse and asStr" {

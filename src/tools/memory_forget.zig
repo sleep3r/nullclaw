@@ -7,8 +7,10 @@ const mem_root = @import("../memory/root.zig");
 const Memory = mem_root.Memory;
 
 /// Memory forget tool — lets the agent delete a memory entry.
+/// When a MemoryRuntime is available, also cleans up the vector store.
 pub const MemoryForgetTool = struct {
     memory: ?Memory = null,
+    mem_rt: ?*mem_root.MemoryRuntime = null,
 
     pub const tool_name = "memory_forget";
     pub const tool_description = "Remove a memory by key. Use to delete outdated facts or sensitive data.";
@@ -28,10 +30,11 @@ pub const MemoryForgetTool = struct {
     pub fn execute(self: *MemoryForgetTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const key = root.getString(args, "key") orelse
             return ToolResult.fail("Missing 'key' parameter");
+        if (key.len == 0) return ToolResult.fail("'key' must not be empty");
 
         const m = self.memory orelse {
             const msg = try std.fmt.allocPrint(allocator, "Memory backend not configured. Cannot forget: {s}", .{key});
-            return ToolResult{ .success = true, .output = msg };
+            return ToolResult{ .success = false, .output = msg };
         };
 
         const forgotten = m.forget(key) catch |err| {
@@ -40,6 +43,10 @@ pub const MemoryForgetTool = struct {
         };
 
         if (forgotten) {
+            // Best-effort vector store cleanup
+            if (self.mem_rt) |rt| {
+                rt.deleteFromVectorStore(key);
+            }
             const msg = try std.fmt.allocPrint(allocator, "Forgot memory: {s}", .{key});
             return ToolResult{ .success = true, .output = msg };
         } else {
@@ -71,7 +78,7 @@ test "memory_forget executes without backend" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
-    try std.testing.expect(result.success);
+    try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "not configured") != null);
 }
 

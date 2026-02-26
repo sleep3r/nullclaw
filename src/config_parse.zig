@@ -438,7 +438,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
-    // Agent bindings (OpenClaw-style key, snake_case payload fields).
+    // Agent bindings (snake_case payload fields).
     const bindings_src = root.get("bindings");
     if (bindings_src) |bindings_val| {
         if (bindings_val == .array) {
@@ -655,6 +655,21 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
+    // Cron
+    if (root.get("cron")) |cr| {
+        if (cr == .object) {
+            if (cr.object.get("enabled")) |v| {
+                if (v == .bool) self.cron.enabled = v.bool;
+            }
+            if (cr.object.get("interval_minutes")) |v| {
+                if (v == .integer) self.cron.interval_minutes = @intCast(v.integer);
+            }
+            if (cr.object.get("max_run_history")) |v| {
+                if (v == .integer) self.cron.max_run_history = @intCast(v.integer);
+            }
+        }
+    }
+
     // Agent
     if (root.get("agent")) |ag| {
         if (ag == .object) {
@@ -684,6 +699,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (ag.object.get("compaction_max_source_chars")) |v| {
                 if (v == .integer) self.agent.compaction_max_source_chars = @intCast(v.integer);
+            }
+            if (ag.object.get("token_limit")) |v| {
+                if (v == .integer and v.integer >= 0) {
+                    self.agent.token_limit = @intCast(v.integer);
+                    self.agent.token_limit_explicit = true;
+                }
             }
             if (ag.object.get("message_timeout_secs")) |v| {
                 if (v == .integer) self.agent.message_timeout_secs = @intCast(v.integer);
@@ -732,7 +753,11 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                                             if (v == .string) self.audio_media.base_url = try self.allocator.dupe(u8, v.string);
                                         }
                                         if (m0.object.get("language")) |v| {
-                                            if (v == .string) self.audio_media.language = try self.allocator.dupe(u8, v.string);
+                                            if (v == .string) {
+                                                // Free prior allocation from audio.language if it was set above
+                                                if (self.audio_media.language) |prev| self.allocator.free(prev);
+                                                self.audio_media.language = try self.allocator.dupe(u8, v.string);
+                                            }
                                         }
                                     }
                                 }
@@ -747,65 +772,490 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
     // Memory
     if (root.get("memory")) |mem| {
         if (mem == .object) {
+            if (mem.object.get("profile")) |v| {
+                if (v == .string) self.memory.profile = try self.allocator.dupe(u8, v.string);
+            }
             if (mem.object.get("backend")) |v| {
                 if (v == .string) self.memory.backend = try self.allocator.dupe(u8, v.string);
             }
             if (mem.object.get("auto_save")) |v| {
                 if (v == .bool) self.memory.auto_save = v.bool;
             }
-            if (mem.object.get("hygiene_enabled")) |v| {
-                if (v == .bool) self.memory.hygiene_enabled = v.bool;
+            if (mem.object.get("citations")) |v| {
+                if (v == .string) self.memory.citations = try self.allocator.dupe(u8, v.string);
             }
-            if (mem.object.get("archive_after_days")) |v| {
-                if (v == .integer) self.memory.archive_after_days = @intCast(v.integer);
+
+            // search
+            if (mem.object.get("search")) |search_val| {
+                if (search_val == .object) {
+                    const search = search_val.object;
+                    if (search.get("enabled")) |v| if (v == .bool) {
+                        self.memory.search.enabled = v.bool;
+                    };
+                    if (search.get("provider")) |v| if (v == .string) {
+                        self.memory.search.provider = try self.allocator.dupe(u8, v.string);
+                    };
+                    if (search.get("model")) |v| if (v == .string) {
+                        self.memory.search.model = try self.allocator.dupe(u8, v.string);
+                    };
+                    if (search.get("dimensions")) |v| if (v == .integer) {
+                        self.memory.search.dimensions = @intCast(v.integer);
+                    };
+                    if (search.get("fallback_provider")) |v| if (v == .string) {
+                        self.memory.search.fallback_provider = try self.allocator.dupe(u8, v.string);
+                    };
+
+                    // search.store
+                    if (search.get("store")) |store_val| {
+                        if (store_val == .object) {
+                            const store = store_val.object;
+                            if (store.get("kind")) |v| if (v == .string) {
+                                self.memory.search.store.kind = try self.allocator.dupe(u8, v.string);
+                            };
+                            if (store.get("sidecar_path")) |v| if (v == .string) {
+                                self.memory.search.store.sidecar_path = try self.allocator.dupe(u8, v.string);
+                            };
+                            if (store.get("qdrant_url")) |v| if (v == .string) {
+                                self.memory.search.store.qdrant_url = try self.allocator.dupe(u8, v.string);
+                            };
+                            if (store.get("qdrant_collection")) |v| if (v == .string) {
+                                self.memory.search.store.qdrant_collection = try self.allocator.dupe(u8, v.string);
+                            };
+                            if (store.get("qdrant_api_key")) |v| if (v == .string) {
+                                self.memory.search.store.qdrant_api_key = try self.allocator.dupe(u8, v.string);
+                            };
+                            if (store.get("pgvector_table")) |v| if (v == .string) {
+                                self.memory.search.store.pgvector_table = try self.allocator.dupe(u8, v.string);
+                            };
+                        }
+                    }
+
+                    // search.chunking
+                    if (search.get("chunking")) |chunking_val| {
+                        if (chunking_val == .object) {
+                            const chunking = chunking_val.object;
+                            if (chunking.get("max_tokens")) |v| if (v == .integer) {
+                                self.memory.search.chunking.max_tokens = @intCast(v.integer);
+                            };
+                            if (chunking.get("overlap")) |v| if (v == .integer) {
+                                self.memory.search.chunking.overlap = @intCast(v.integer);
+                            };
+                        }
+                    }
+
+                    // search.sync
+                    if (search.get("sync")) |sync_val| {
+                        if (sync_val == .object) {
+                            const sync = sync_val.object;
+                            if (sync.get("mode")) |v| if (v == .string) {
+                                self.memory.search.sync.mode = try self.allocator.dupe(u8, v.string);
+                            };
+                            if (sync.get("embed_timeout_ms")) |v| if (v == .integer) {
+                                self.memory.search.sync.embed_timeout_ms = @intCast(v.integer);
+                            };
+                            if (sync.get("vector_timeout_ms")) |v| if (v == .integer) {
+                                self.memory.search.sync.vector_timeout_ms = @intCast(v.integer);
+                            };
+                            if (sync.get("embed_max_retries")) |v| if (v == .integer) {
+                                self.memory.search.sync.embed_max_retries = @intCast(v.integer);
+                            };
+                            if (sync.get("vector_max_retries")) |v| if (v == .integer) {
+                                self.memory.search.sync.vector_max_retries = @intCast(v.integer);
+                            };
+                        }
+                    }
+
+                    // search.query
+                    if (search.get("query")) |query_val| {
+                        if (query_val == .object) {
+                            const query = query_val.object;
+                            if (query.get("max_results")) |v| if (v == .integer) {
+                                self.memory.search.query.max_results = @intCast(v.integer);
+                            };
+                            if (query.get("min_score")) |v| {
+                                if (v == .float) self.memory.search.query.min_score = v.float;
+                                if (v == .integer) self.memory.search.query.min_score = @floatFromInt(v.integer);
+                            }
+                            if (query.get("merge_strategy")) |v| if (v == .string) {
+                                self.memory.search.query.merge_strategy = try self.allocator.dupe(u8, v.string);
+                            };
+                            if (query.get("rrf_k")) |v| if (v == .integer) {
+                                self.memory.search.query.rrf_k = @intCast(v.integer);
+                            };
+
+                            // search.query.hybrid
+                            if (query.get("hybrid")) |hybrid_val| {
+                                if (hybrid_val == .object) {
+                                    const hybrid = hybrid_val.object;
+                                    if (hybrid.get("enabled")) |v| if (v == .bool) {
+                                        self.memory.search.query.hybrid.enabled = v.bool;
+                                    };
+                                    if (hybrid.get("vector_weight")) |v| {
+                                        if (v == .float) self.memory.search.query.hybrid.vector_weight = v.float;
+                                        if (v == .integer) self.memory.search.query.hybrid.vector_weight = @floatFromInt(v.integer);
+                                    }
+                                    if (hybrid.get("text_weight")) |v| {
+                                        if (v == .float) self.memory.search.query.hybrid.text_weight = v.float;
+                                        if (v == .integer) self.memory.search.query.hybrid.text_weight = @floatFromInt(v.integer);
+                                    }
+                                    if (hybrid.get("candidate_multiplier")) |v| if (v == .integer) {
+                                        self.memory.search.query.hybrid.candidate_multiplier = @intCast(v.integer);
+                                    };
+
+                                    // search.query.hybrid.mmr
+                                    if (hybrid.get("mmr")) |mmr_val| {
+                                        if (mmr_val == .object) {
+                                            const mmr = mmr_val.object;
+                                            if (mmr.get("enabled")) |v| if (v == .bool) {
+                                                self.memory.search.query.hybrid.mmr.enabled = v.bool;
+                                            };
+                                            if (mmr.get("lambda")) |v| {
+                                                if (v == .float) self.memory.search.query.hybrid.mmr.lambda = v.float;
+                                                if (v == .integer) self.memory.search.query.hybrid.mmr.lambda = @floatFromInt(v.integer);
+                                            }
+                                        }
+                                    }
+
+                                    // search.query.hybrid.temporal_decay
+                                    if (hybrid.get("temporal_decay")) |td_val| {
+                                        if (td_val == .object) {
+                                            const td = td_val.object;
+                                            if (td.get("enabled")) |v| if (v == .bool) {
+                                                self.memory.search.query.hybrid.temporal_decay.enabled = v.bool;
+                                            };
+                                            if (td.get("half_life_days")) |v| if (v == .integer) {
+                                                self.memory.search.query.hybrid.temporal_decay.half_life_days = @intCast(v.integer);
+                                            };
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // search.cache
+                    if (search.get("cache")) |cache_val| {
+                        if (cache_val == .object) {
+                            const cache = cache_val.object;
+                            if (cache.get("enabled")) |v| if (v == .bool) {
+                                self.memory.search.cache.enabled = v.bool;
+                            };
+                            if (cache.get("max_entries")) |v| if (v == .integer) {
+                                self.memory.search.cache.max_entries = @intCast(v.integer);
+                            };
+                        }
+                    }
+                }
             }
-            if (mem.object.get("purge_after_days")) |v| {
-                if (v == .integer) self.memory.purge_after_days = @intCast(v.integer);
+
+            // qmd
+            if (mem.object.get("qmd")) |qmd_val| {
+                if (qmd_val == .object) {
+                    const qmd = qmd_val.object;
+                    if (qmd.get("enabled")) |v| if (v == .bool) {
+                        self.memory.qmd.enabled = v.bool;
+                    };
+                    if (qmd.get("command")) |v| if (v == .string) {
+                        self.memory.qmd.command = try self.allocator.dupe(u8, v.string);
+                    };
+                    if (qmd.get("search_mode")) |v| if (v == .string) {
+                        self.memory.qmd.search_mode = try self.allocator.dupe(u8, v.string);
+                    };
+                    if (qmd.get("include_default_memory")) |v| if (v == .bool) {
+                        self.memory.qmd.include_default_memory = v.bool;
+                    };
+
+                    // qmd.mcporter
+                    if (qmd.get("mcporter")) |mcp_val| {
+                        if (mcp_val == .object) {
+                            const mcp = mcp_val.object;
+                            if (mcp.get("enabled")) |v| if (v == .bool) {
+                                self.memory.qmd.mcporter.enabled = v.bool;
+                            };
+                            if (mcp.get("server_name")) |v| if (v == .string) {
+                                self.memory.qmd.mcporter.server_name = try self.allocator.dupe(u8, v.string);
+                            };
+                            if (mcp.get("start_daemon")) |v| if (v == .bool) {
+                                self.memory.qmd.mcporter.start_daemon = v.bool;
+                            };
+                        }
+                    }
+
+                    // qmd.paths
+                    if (qmd.get("paths")) |paths_val| {
+                        if (paths_val == .array) {
+                            const items = paths_val.array.items;
+                            var list = try self.allocator.alloc(types.QmdIndexPath, items.len);
+                            var count: usize = 0;
+                            for (items) |item| {
+                                if (item == .object) {
+                                    var entry: types.QmdIndexPath = .{};
+                                    if (item.object.get("path")) |v| if (v == .string) {
+                                        entry.path = try self.allocator.dupe(u8, v.string);
+                                    };
+                                    if (item.object.get("name")) |v| if (v == .string) {
+                                        entry.name = try self.allocator.dupe(u8, v.string);
+                                    };
+                                    if (item.object.get("pattern")) |v| if (v == .string) {
+                                        entry.pattern = try self.allocator.dupe(u8, v.string);
+                                    };
+                                    list[count] = entry;
+                                    count += 1;
+                                }
+                            }
+                            self.memory.qmd.paths = list[0..count];
+                        }
+                    }
+
+                    // qmd.sessions
+                    if (qmd.get("sessions")) |sess_val| {
+                        if (sess_val == .object) {
+                            const sess = sess_val.object;
+                            if (sess.get("enabled")) |v| if (v == .bool) {
+                                self.memory.qmd.sessions.enabled = v.bool;
+                            };
+                            if (sess.get("export_dir")) |v| if (v == .string) {
+                                self.memory.qmd.sessions.export_dir = try self.allocator.dupe(u8, v.string);
+                            };
+                            if (sess.get("retention_days")) |v| if (v == .integer) {
+                                self.memory.qmd.sessions.retention_days = @intCast(v.integer);
+                            };
+                        }
+                    }
+
+                    // qmd.update
+                    if (qmd.get("update")) |upd_val| {
+                        if (upd_val == .object) {
+                            const upd = upd_val.object;
+                            if (upd.get("interval_ms")) |v| if (v == .integer) {
+                                self.memory.qmd.update.interval_ms = @intCast(v.integer);
+                            };
+                            if (upd.get("debounce_ms")) |v| if (v == .integer) {
+                                self.memory.qmd.update.debounce_ms = @intCast(v.integer);
+                            };
+                            if (upd.get("on_boot")) |v| if (v == .bool) {
+                                self.memory.qmd.update.on_boot = v.bool;
+                            };
+                            if (upd.get("wait_for_boot_sync")) |v| if (v == .bool) {
+                                self.memory.qmd.update.wait_for_boot_sync = v.bool;
+                            };
+                            if (upd.get("embed_interval_ms")) |v| if (v == .integer) {
+                                self.memory.qmd.update.embed_interval_ms = @intCast(v.integer);
+                            };
+                            if (upd.get("command_timeout_ms")) |v| if (v == .integer) {
+                                self.memory.qmd.update.command_timeout_ms = @intCast(v.integer);
+                            };
+                            if (upd.get("update_timeout_ms")) |v| if (v == .integer) {
+                                self.memory.qmd.update.update_timeout_ms = @intCast(v.integer);
+                            };
+                            if (upd.get("embed_timeout_ms")) |v| if (v == .integer) {
+                                self.memory.qmd.update.embed_timeout_ms = @intCast(v.integer);
+                            };
+                        }
+                    }
+
+                    // qmd.limits
+                    if (qmd.get("limits")) |lim_val| {
+                        if (lim_val == .object) {
+                            const lim = lim_val.object;
+                            if (lim.get("max_results")) |v| if (v == .integer) {
+                                self.memory.qmd.limits.max_results = @intCast(v.integer);
+                            };
+                            if (lim.get("max_snippet_chars")) |v| if (v == .integer) {
+                                self.memory.qmd.limits.max_snippet_chars = @intCast(v.integer);
+                            };
+                            if (lim.get("max_injected_chars")) |v| if (v == .integer) {
+                                self.memory.qmd.limits.max_injected_chars = @intCast(v.integer);
+                            };
+                            if (lim.get("timeout_ms")) |v| if (v == .integer) {
+                                self.memory.qmd.limits.timeout_ms = @intCast(v.integer);
+                            };
+                        }
+                    }
+                }
             }
-            if (mem.object.get("conversation_retention_days")) |v| {
-                if (v == .integer) self.memory.conversation_retention_days = @intCast(v.integer);
+
+            // lifecycle
+            if (mem.object.get("lifecycle")) |lc_val| {
+                if (lc_val == .object) {
+                    const lc = lc_val.object;
+                    if (lc.get("hygiene_enabled")) |v| if (v == .bool) {
+                        self.memory.lifecycle.hygiene_enabled = v.bool;
+                    };
+                    if (lc.get("archive_after_days")) |v| if (v == .integer) {
+                        self.memory.lifecycle.archive_after_days = @intCast(v.integer);
+                    };
+                    if (lc.get("purge_after_days")) |v| if (v == .integer) {
+                        self.memory.lifecycle.purge_after_days = @intCast(v.integer);
+                    };
+                    if (lc.get("conversation_retention_days")) |v| if (v == .integer) {
+                        self.memory.lifecycle.conversation_retention_days = @intCast(v.integer);
+                    };
+                    if (lc.get("snapshot_enabled")) |v| if (v == .bool) {
+                        self.memory.lifecycle.snapshot_enabled = v.bool;
+                    };
+                    if (lc.get("snapshot_on_hygiene")) |v| if (v == .bool) {
+                        self.memory.lifecycle.snapshot_on_hygiene = v.bool;
+                    };
+                    if (lc.get("auto_hydrate")) |v| if (v == .bool) {
+                        self.memory.lifecycle.auto_hydrate = v.bool;
+                    };
+                }
             }
-            if (mem.object.get("embedding_provider")) |v| {
-                if (v == .string) self.memory.embedding_provider = try self.allocator.dupe(u8, v.string);
+
+            // response_cache
+            if (mem.object.get("response_cache")) |rc_val| {
+                if (rc_val == .object) {
+                    const rc = rc_val.object;
+                    if (rc.get("enabled")) |v| if (v == .bool) {
+                        self.memory.response_cache.enabled = v.bool;
+                    };
+                    if (rc.get("ttl_minutes")) |v| if (v == .integer) {
+                        self.memory.response_cache.ttl_minutes = @intCast(v.integer);
+                    };
+                    if (rc.get("max_entries")) |v| if (v == .integer) {
+                        self.memory.response_cache.max_entries = @intCast(v.integer);
+                    };
+                }
             }
-            if (mem.object.get("embedding_model")) |v| {
-                if (v == .string) self.memory.embedding_model = try self.allocator.dupe(u8, v.string);
+
+            // reliability
+            if (mem.object.get("reliability")) |rel_val| {
+                if (rel_val == .object) {
+                    const rel = rel_val.object;
+                    if (rel.get("rollout_mode")) |v| if (v == .string) {
+                        self.memory.reliability.rollout_mode = try self.allocator.dupe(u8, v.string);
+                    };
+                    if (rel.get("circuit_breaker_failures")) |v| if (v == .integer) {
+                        self.memory.reliability.circuit_breaker_failures = @intCast(v.integer);
+                    };
+                    if (rel.get("circuit_breaker_cooldown_ms")) |v| if (v == .integer) {
+                        self.memory.reliability.circuit_breaker_cooldown_ms = @intCast(v.integer);
+                    };
+                    if (rel.get("shadow_hybrid_percent")) |v| if (v == .integer) {
+                        self.memory.reliability.shadow_hybrid_percent = @intCast(v.integer);
+                    };
+                    if (rel.get("canary_hybrid_percent")) |v| if (v == .integer) {
+                        self.memory.reliability.canary_hybrid_percent = @intCast(v.integer);
+                    };
+                    if (rel.get("fallback_policy")) |v| if (v == .string) {
+                        self.memory.reliability.fallback_policy = try self.allocator.dupe(u8, v.string);
+                    };
+                }
             }
-            if (mem.object.get("embedding_dimensions")) |v| {
-                if (v == .integer) self.memory.embedding_dimensions = @intCast(v.integer);
+
+            // postgres
+            if (mem.object.get("postgres")) |pg_val| {
+                if (pg_val == .object) {
+                    const pg = pg_val.object;
+                    if (pg.get("url")) |v| if (v == .string) {
+                        self.memory.postgres.url = try self.allocator.dupe(u8, v.string);
+                    };
+                    if (pg.get("schema")) |v| if (v == .string) {
+                        self.memory.postgres.schema = try self.allocator.dupe(u8, v.string);
+                    };
+                    if (pg.get("table")) |v| if (v == .string) {
+                        self.memory.postgres.table = try self.allocator.dupe(u8, v.string);
+                    };
+                    if (pg.get("connect_timeout_secs")) |v| if (v == .integer) {
+                        self.memory.postgres.connect_timeout_secs = @intCast(v.integer);
+                    };
+                }
             }
-            if (mem.object.get("vector_weight")) |v| {
-                if (v == .float) self.memory.vector_weight = v.float;
-                if (v == .integer) self.memory.vector_weight = @floatFromInt(v.integer);
+            // redis
+            if (mem.object.get("redis")) |redis_val| {
+                if (redis_val == .object) {
+                    const rd = redis_val.object;
+                    if (rd.get("host")) |v| if (v == .string) {
+                        self.memory.redis.host = try self.allocator.dupe(u8, v.string);
+                    };
+                    if (rd.get("port")) |v| if (v == .integer) {
+                        self.memory.redis.port = @intCast(v.integer);
+                    };
+                    if (rd.get("password")) |v| if (v == .string) {
+                        self.memory.redis.password = try self.allocator.dupe(u8, v.string);
+                    };
+                    if (rd.get("db_index")) |v| if (v == .integer) {
+                        self.memory.redis.db_index = @intCast(v.integer);
+                    };
+                    if (rd.get("key_prefix")) |v| if (v == .string) {
+                        self.memory.redis.key_prefix = try self.allocator.dupe(u8, v.string);
+                    };
+                    if (rd.get("ttl_seconds")) |v| if (v == .integer) {
+                        self.memory.redis.ttl_seconds = @intCast(v.integer);
+                    };
+                }
             }
-            if (mem.object.get("keyword_weight")) |v| {
-                if (v == .float) self.memory.keyword_weight = v.float;
-                if (v == .integer) self.memory.keyword_weight = @floatFromInt(v.integer);
+
+            // api
+            if (mem.object.get("api")) |api_val| {
+                if (api_val == .object) {
+                    const api = api_val.object;
+                    if (api.get("url")) |v| if (v == .string) {
+                        self.memory.api.url = try self.allocator.dupe(u8, v.string);
+                    };
+                    if (api.get("api_key")) |v| if (v == .string) {
+                        self.memory.api.api_key = try self.allocator.dupe(u8, v.string);
+                    };
+                    if (api.get("timeout_ms")) |v| if (v == .integer) {
+                        self.memory.api.timeout_ms = @intCast(v.integer);
+                    };
+                    if (api.get("namespace")) |v| if (v == .string) {
+                        self.memory.api.namespace = try self.allocator.dupe(u8, v.string);
+                    };
+                }
             }
-            if (mem.object.get("embedding_cache_size")) |v| {
-                if (v == .integer) self.memory.embedding_cache_size = @intCast(v.integer);
+
+            // retrieval_stages
+            if (mem.object.get("retrieval_stages")) |rs_val| {
+                if (rs_val == .object) {
+                    const rs = rs_val.object;
+                    if (rs.get("query_expansion_enabled")) |v| if (v == .bool) {
+                        self.memory.retrieval_stages.query_expansion_enabled = v.bool;
+                    };
+                    if (rs.get("adaptive_retrieval_enabled")) |v| if (v == .bool) {
+                        self.memory.retrieval_stages.adaptive_retrieval_enabled = v.bool;
+                    };
+                    if (rs.get("adaptive_keyword_max_tokens")) |v| if (v == .integer) {
+                        self.memory.retrieval_stages.adaptive_keyword_max_tokens = @intCast(v.integer);
+                    };
+                    if (rs.get("adaptive_vector_min_tokens")) |v| if (v == .integer) {
+                        self.memory.retrieval_stages.adaptive_vector_min_tokens = @intCast(v.integer);
+                    };
+                    if (rs.get("llm_reranker_enabled")) |v| if (v == .bool) {
+                        self.memory.retrieval_stages.llm_reranker_enabled = v.bool;
+                    };
+                    if (rs.get("llm_reranker_max_candidates")) |v| if (v == .integer) {
+                        self.memory.retrieval_stages.llm_reranker_max_candidates = @intCast(v.integer);
+                    };
+                    if (rs.get("llm_reranker_timeout_ms")) |v| if (v == .integer) {
+                        self.memory.retrieval_stages.llm_reranker_timeout_ms = @intCast(v.integer);
+                    };
+                }
             }
-            if (mem.object.get("chunk_max_tokens")) |v| {
-                if (v == .integer) self.memory.chunk_max_tokens = @intCast(v.integer);
+
+            // summarizer
+            if (mem.object.get("summarizer")) |sum_val| {
+                if (sum_val == .object) {
+                    const sum = sum_val.object;
+                    if (sum.get("enabled")) |v| if (v == .bool) {
+                        self.memory.summarizer.enabled = v.bool;
+                    };
+                    if (sum.get("window_size_tokens")) |v| if (v == .integer) {
+                        self.memory.summarizer.window_size_tokens = @intCast(v.integer);
+                    };
+                    if (sum.get("summary_max_tokens")) |v| if (v == .integer) {
+                        self.memory.summarizer.summary_max_tokens = @intCast(v.integer);
+                    };
+                    if (sum.get("auto_extract_semantic")) |v| if (v == .bool) {
+                        self.memory.summarizer.auto_extract_semantic = v.bool;
+                    };
+                }
             }
-            if (mem.object.get("response_cache_enabled")) |v| {
-                if (v == .bool) self.memory.response_cache_enabled = v.bool;
-            }
-            if (mem.object.get("response_cache_ttl_minutes")) |v| {
-                if (v == .integer) self.memory.response_cache_ttl_minutes = @intCast(v.integer);
-            }
-            if (mem.object.get("response_cache_max_entries")) |v| {
-                if (v == .integer) self.memory.response_cache_max_entries = @intCast(v.integer);
-            }
-            if (mem.object.get("snapshot_enabled")) |v| {
-                if (v == .bool) self.memory.snapshot_enabled = v.bool;
-            }
-            if (mem.object.get("snapshot_on_hygiene")) |v| {
-                if (v == .bool) self.memory.snapshot_on_hygiene = v.bool;
-            }
-            if (mem.object.get("auto_hydrate")) |v| {
-                if (v == .bool) self.memory.auto_hydrate = v.bool;
-            }
+
+            // Apply profile defaults after all explicit overrides have been parsed.
+            // Only sets fields that are still at their default values.
+            self.memory.applyProfileDefaults();
         }
     }
 
@@ -940,6 +1390,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (hr.object.get("timeout_secs")) |v| {
                 if (v == .integer) self.http_request.timeout_secs = @intCast(v.integer);
             }
+            if (hr.object.get("allowed_domains")) |v| {
+                if (v == .array) self.http_request.allowed_domains = try parseStringArray(self.allocator, v.array);
+            }
         }
     }
 
@@ -1021,6 +1474,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     if (res.object.get("max_memory_mb")) |v| {
                         if (v == .integer) self.security.resources.max_memory_mb = @intCast(v.integer);
                     }
+                    if (res.object.get("max_cpu_percent")) |v| {
+                        if (v == .integer) self.security.resources.max_cpu_percent = @intCast(v.integer);
+                    }
+                    if (res.object.get("max_disk_mb")) |v| {
+                        if (v == .integer) self.security.resources.max_disk_mb = @intCast(v.integer);
+                    }
                     if (res.object.get("max_cpu_time_seconds")) |v| {
                         if (v == .integer) self.security.resources.max_cpu_time_seconds = @intCast(v.integer);
                     }
@@ -1039,6 +1498,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     }
                     if (aud.object.get("log_path")) |v| {
                         if (v == .string) self.security.audit.log_path = try self.allocator.dupe(u8, v.string);
+                    }
+                    if (aud.object.get("retention_days")) |v| {
+                        if (v == .integer) self.security.audit.retention_days = @intCast(v.integer);
                     }
                     if (aud.object.get("max_size_mb")) |v| {
                         if (v == .integer) self.security.audit.max_size_mb = @intCast(v.integer);

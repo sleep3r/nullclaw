@@ -11,6 +11,7 @@
 //! Uses std.http.Server (built-in, no external deps).
 
 const std = @import("std");
+const build_options = @import("build_options");
 const health = @import("health.zig");
 const Config = @import("config.zig").Config;
 const config_types = @import("config_types.zig");
@@ -18,6 +19,7 @@ const session_mod = @import("session.zig");
 const providers = @import("providers/root.zig");
 const tools_mod = @import("tools/root.zig");
 const memory_mod = @import("memory/root.zig");
+const subagent_mod = @import("subagent.zig");
 const observability = @import("observability.zig");
 const agent_routing = @import("agent_routing.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
@@ -514,6 +516,68 @@ fn constantTimeEql(a: *const [32]u8, b: *const [32]u8) bool {
 
 // ── JSON Helpers ────────────────────────────────────────────────
 
+/// Escape a string for safe embedding inside a JSON string value.
+/// Handles: \ → \\, " → \", control chars (0x00-0x1F) → \uXXXX,
+/// newlines → \n, tabs → \t, carriage returns → \r.
+pub fn jsonEscapeInto(writer: anytype, input: []const u8) !void {
+    for (input) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            0x08 => try writer.writeAll("\\b"),
+            0x0C => try writer.writeAll("\\f"),
+            else => {
+                if (c < 0x20) {
+                    try writer.print("\\u{x:0>4}", .{c});
+                } else {
+                    try writer.writeByte(c);
+                }
+            },
+        }
+    }
+}
+
+/// Wrap a value as a JSON string field: `"key":"escaped_value"`.
+/// Returns an owned slice allocated with the provided allocator.
+pub fn jsonWrapField(allocator: std.mem.Allocator, key: []const u8, value: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeByte('"');
+    try w.writeAll(key);
+    try w.writeAll("\":\"");
+    try jsonEscapeInto(w, value);
+    try w.writeByte('"');
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Build a JSON response object: `{"status":"ok","response":"<escaped>"}`.
+/// Returns an owned slice. Caller must free.
+pub fn jsonWrapResponse(allocator: std.mem.Allocator, response: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("{\"status\":\"ok\",\"response\":\"");
+    try jsonEscapeInto(w, response);
+    try w.writeAll("\"}");
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Build a JSON challenge response: `{"challenge":"<escaped>"}`.
+/// Returns an owned slice. Caller must free.
+fn jsonWrapChallenge(allocator: std.mem.Allocator, challenge: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("{\"challenge\":\"");
+    try jsonEscapeInto(w, challenge);
+    try w.writeAll("\"}");
+    return buf.toOwnedSlice(allocator);
+}
+
 /// Extract a string field from a JSON blob (minimal parser, no allocations).
 pub fn jsonStringField(json: []const u8, key: []const u8) ?[]const u8 {
     var needle_buf: [256]u8 = undefined;
@@ -592,6 +656,7 @@ fn selectWhatsAppConfig(
     body: ?[]const u8,
     verify_token: ?[]const u8,
 ) ?*const config_types.WhatsAppConfig {
+    if (!build_options.enable_channel_whatsapp) return null;
     const cfg = cfg_opt orelse return null;
     if (cfg.channels.whatsapp.len == 0) return null;
 
@@ -623,6 +688,7 @@ fn selectTelegramConfig(
     cfg_opt: ?*const Config,
     target: []const u8,
 ) ?*const config_types.TelegramConfig {
+    if (!build_options.enable_channel_telegram) return null;
     const cfg = cfg_opt orelse return null;
     if (cfg.channels.telegram.len == 0) return null;
 
@@ -646,6 +712,7 @@ fn selectTelegramConfig(
 }
 
 fn hasLineSecrets(cfg: *const Config) bool {
+    if (!build_options.enable_channel_line) return false;
     for (cfg.channels.line) |line_cfg| {
         if (line_cfg.channel_secret.len > 0) return true;
     }
@@ -657,6 +724,7 @@ fn selectLineConfigBySignature(
     body: []const u8,
     signature: ?[]const u8,
 ) ?*const config_types.LineConfig {
+    if (!build_options.enable_channel_line) return null;
     const cfg = cfg_opt orelse return null;
     if (cfg.channels.line.len == 0) return null;
 
@@ -688,6 +756,7 @@ fn selectLarkConfig(
     cfg_opt: ?*const Config,
     body: []const u8,
 ) ?*const config_types.LarkConfig {
+    if (!build_options.enable_channel_lark) return null;
     const cfg = cfg_opt orelse return null;
     if (cfg.channels.lark.len == 0) return null;
 
@@ -706,10 +775,12 @@ fn webhookBasePath(target: []const u8) []const u8 {
 }
 
 fn normalizeSlackWebhookPath(path: []const u8) []const u8 {
+    if (!build_options.enable_channel_slack) return path;
     return channels.slack.SlackChannel.normalizeWebhookPath(path);
 }
 
 fn hasSlackHttpEndpoint(cfg_opt: ?*const Config, base_path: []const u8) bool {
+    if (!build_options.enable_channel_slack) return false;
     const cfg = cfg_opt orelse return std.mem.eql(u8, base_path, channels.slack.SlackChannel.DEFAULT_WEBHOOK_PATH);
     for (cfg.channels.slack) |slack_cfg| {
         if (slack_cfg.mode != .http) continue;
@@ -766,6 +837,7 @@ fn findSlackConfigForRequest(
     timestamp_header: ?[]const u8,
     signature_header: ?[]const u8,
 ) ?*const config_types.SlackConfig {
+    if (!build_options.enable_channel_slack) return null;
     const cfg = cfg_opt orelse return null;
     if (cfg.channels.slack.len == 0) return null;
 
@@ -1224,8 +1296,9 @@ pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, ch
 
 fn userFacingAgentError(err: anyerror) []const u8 {
     return switch (err) {
-        error.CurlFailed, error.CurlReadError, error.CurlWaitError => "Network error. Please try again.",
+        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
         error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
+        error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
         error.NoResponseContent => "Model returned an empty response. Please try again.",
         error.OutOfMemory => "Out of memory.",
         else => "An error occurred. Try again.",
@@ -1234,8 +1307,9 @@ fn userFacingAgentError(err: anyerror) []const u8 {
 
 fn userFacingAgentErrorJson(err: anyerror) []const u8 {
     return switch (err) {
-        error.CurlFailed, error.CurlReadError, error.CurlWaitError => "{\"error\":\"network error\"}",
+        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "{\"error\":\"network error\"}",
         error.ProviderDoesNotSupportVision => "{\"error\":\"provider does not support image input\"}",
+        error.AllProvidersFailed => "{\"error\":\"all providers failed for this request\"}",
         error.NoResponseContent => "{\"error\":\"model returned empty response\"}",
         error.OutOfMemory => "{\"error\":\"out of memory\"}",
         else => "{\"error\":\"agent failure\"}",
@@ -1278,6 +1352,12 @@ fn findWebhookRouteDescriptor(path: []const u8) ?*const WebhookRouteDescriptor {
 }
 
 fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
+    if (!build_options.enable_channel_telegram) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"telegram channel disabled in this build\"}";
+        return;
+    }
+
     const is_post = std.mem.eql(u8, ctx.method, "POST");
     if (!is_post) {
         ctx.response_status = "405 Method Not Allowed";
@@ -1361,6 +1441,12 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
 }
 
 fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
+    if (!build_options.enable_channel_whatsapp) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"whatsapp channel disabled in this build\"}";
+        return;
+    }
+
     const is_get = std.mem.eql(u8, ctx.method, "GET");
     if (is_get) {
         const mode = parseQueryParam(ctx.target, "hub.mode");
@@ -1545,6 +1631,12 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
 }
 
 fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
+    if (!build_options.enable_channel_slack) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"slack channel disabled in this build\"}";
+        return;
+    }
+
     if (!std.mem.eql(u8, ctx.method, "POST")) {
         ctx.response_status = "405 Method Not Allowed";
         ctx.response_body = "{\"error\":\"method not allowed\"}";
@@ -1596,7 +1688,7 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
             ctx.response_body = "{\"status\":\"ok\"}";
             return;
         }
-        const challenge_resp = std.fmt.allocPrint(ctx.req_allocator, "{{\"challenge\":\"{s}\"}}", .{challenge}) catch {
+        const challenge_resp = jsonWrapChallenge(ctx.req_allocator, challenge) catch {
             ctx.response_body = "{\"status\":\"ok\"}";
             return;
         };
@@ -1758,6 +1850,12 @@ fn linePeerMetadata(evt: channels.line.LineEvent, peer_buf: []u8) struct {
 }
 
 fn handleLineWebhookRoute(ctx: *WebhookHandlerContext) void {
+    if (!build_options.enable_channel_line) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"line channel disabled in this build\"}";
+        return;
+    }
+
     const is_post = std.mem.eql(u8, ctx.method, "POST");
     if (!is_post) {
         ctx.response_status = "405 Method Not Allowed";
@@ -1872,6 +1970,12 @@ fn handleLineWebhookRoute(ctx: *WebhookHandlerContext) void {
 }
 
 fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
+    if (!build_options.enable_channel_lark) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"lark channel disabled in this build\"}";
+        return;
+    }
+
     const is_post = std.mem.eql(u8, ctx.method, "POST");
     if (!is_post) {
         ctx.response_status = "405 Method Not Allowed";
@@ -1904,7 +2008,7 @@ fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
     if (std.mem.indexOf(u8, body, "\"url_verification\"") != null) {
         const challenge = jsonStringField(body, "challenge");
         if (challenge) |c| {
-            const challenge_resp = std.fmt.allocPrint(ctx.req_allocator, "{{\"challenge\":\"{s}\"}}", .{c}) catch null;
+            const challenge_resp = jsonWrapChallenge(ctx.req_allocator, c) catch null;
             ctx.response_body = challenge_resp orelse "{\"status\":\"ok\"}";
         } else {
             ctx.response_body = "{\"status\":\"ok\"}";
@@ -1996,8 +2100,10 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     var provider_bundle_opt: ?providers.runtime_bundle.RuntimeProviderBundle = null;
     var session_mgr_opt: ?session_mod.SessionManager = null;
     var tools_slice: []const tools_mod.Tool = &.{};
-    var mem_opt: ?memory_mod.Memory = null;
+    var mem_rt: ?memory_mod.MemoryRuntime = null;
+    var subagent_manager_opt: ?*subagent_mod.SubagentManager = null;
     var noop_obs_gateway = observability.NoopObserver{};
+    const needs_local_agent = event_bus == null;
 
     if (config_opt) |cfg_ptr| {
         const cfg = cfg_ptr;
@@ -2040,38 +2146,53 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             state.lark_account_id = lark_cfg.account_id;
         }
 
-        provider_bundle_opt = try providers.runtime_bundle.RuntimeProviderBundle.init(allocator, cfg);
+        // In daemon mode (`event_bus` is present), inbound processing is delegated to
+        // the bus + channel runtime. Avoid creating a second local agent runtime here.
+        if (needs_local_agent) {
+            provider_bundle_opt = try providers.runtime_bundle.RuntimeProviderBundle.init(allocator, cfg);
 
-        if (provider_bundle_opt) |*bundle| {
-            const provider_i: providers.Provider = bundle.provider();
-            const resolved_api_key = bundle.primaryApiKey();
+            if (provider_bundle_opt) |*bundle| {
+                const provider_i: providers.Provider = bundle.provider();
+                const resolved_api_key = bundle.primaryApiKey();
 
-            // Optional memory backend.
-            const db_path = std.fs.path.joinZ(allocator, &.{ cfg.workspace_dir, "memory.db" }) catch null;
-            defer if (db_path) |p| allocator.free(p);
-            if (db_path) |p| {
-                if (memory_mod.createMemory(allocator, cfg.memory.backend, p)) |mem| {
-                    mem_opt = mem;
-                } else |_| {}
+                // Optional memory backend.
+                mem_rt = memory_mod.initRuntime(allocator, &cfg.memory, cfg.workspace_dir);
+
+                const subagent_manager = allocator.create(subagent_mod.SubagentManager) catch null;
+                if (subagent_manager) |mgr| {
+                    mgr.* = subagent_mod.SubagentManager.init(allocator, cfg, event_bus, .{});
+                    subagent_manager_opt = mgr;
+                }
+
+                // Tools.
+                tools_slice = tools_mod.allTools(allocator, cfg.workspace_dir, .{
+                    .http_enabled = cfg.http_request.enabled,
+                    .browser_enabled = cfg.browser.enabled,
+                    .screenshot_enabled = true,
+                    .agents = cfg.agents,
+                    .fallback_api_key = resolved_api_key,
+                    .subagent_manager = subagent_manager_opt,
+                }) catch &.{};
+
+                const mem_opt: ?memory_mod.Memory = if (mem_rt) |rt| rt.memory else null;
+                var sm = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, noop_obs_gateway.observer(), if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
+                if (mem_rt) |*rt| {
+                    sm.mem_rt = rt;
+                    tools_mod.bindMemoryRuntime(tools_slice, rt);
+                }
+                session_mgr_opt = sm;
             }
-
-            // Tools.
-            tools_slice = tools_mod.allTools(allocator, cfg.workspace_dir, .{
-                .http_enabled = cfg.http_request.enabled,
-                .browser_enabled = cfg.browser.enabled,
-                .screenshot_enabled = true,
-                .agents = cfg.agents,
-                .fallback_api_key = resolved_api_key,
-            }) catch &.{};
-
-            session_mgr_opt = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, noop_obs_gateway.observer());
         }
     }
     if (state.pairing_guard == null) {
         state.pairing_guard = try PairingGuard.init(allocator, true, &.{});
     }
     defer if (provider_bundle_opt) |*bundle| bundle.deinit();
-    defer if (mem_opt) |m| m.deinit();
+    defer if (mem_rt) |*rt| rt.deinit();
+    defer if (subagent_manager_opt) |mgr| {
+        mgr.deinit();
+        allocator.destroy(mgr);
+    };
     defer if (tools_slice.len > 0) tools_mod.deinitTools(allocator, tools_slice);
     defer if (session_mgr_opt) |*sm| sm.deinit();
 
@@ -2088,7 +2209,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     try stdout.print("Gateway listening on {s}:{d}\n", .{ host, port });
     try stdout.flush();
     if (config_opt) |cfg| {
-        cfg.printModelConfig();
+        // In daemon mode the parent already prints model/provider.
+        if (config_ptr == null) cfg.printModelConfig();
     }
     if (state.pairing_guard) |*guard| {
         if (guard.pairingCode()) |code| {
@@ -2213,7 +2335,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                                 };
                                 if (reply) |r| {
                                     defer allocator.free(r);
-                                    const json_resp = std.fmt.allocPrint(req_allocator, "{{\"status\":\"ok\",\"response\":\"{s}\"}}", .{r}) catch null;
+                                    const json_resp = jsonWrapResponse(req_allocator, r) catch null;
                                     response_body = json_resp orelse "{\"status\":\"received\"}";
                                 } else {
                                     response_body = "{\"status\":\"received\"}";
@@ -2703,6 +2825,10 @@ test "selectWhatsAppConfig picks account by phone_number_id" {
     };
     const body = "{\"entry\":[{\"changes\":[{\"value\":{\"metadata\":{\"phone_number_id\":\"222\"}}}]}]}";
     const selected = selectWhatsAppConfig(&cfg, body, null);
+    if (!build_options.enable_channel_whatsapp) {
+        try std.testing.expect(selected == null);
+        return;
+    }
     try std.testing.expect(selected != null);
     try std.testing.expectEqualStrings("backup", selected.?.account_id);
 }
@@ -2730,6 +2856,10 @@ test "selectTelegramConfig picks account by query account_id" {
     };
 
     const selected = selectTelegramConfig(&cfg, "/telegram?account_id=backup");
+    if (!build_options.enable_channel_telegram) {
+        try std.testing.expect(selected == null);
+        return;
+    }
     try std.testing.expect(selected != null);
     try std.testing.expectEqualStrings("backup", selected.?.account_id);
 }
@@ -2755,6 +2885,10 @@ test "selectTelegramConfig falls back to preferred primary account" {
     };
 
     const selected = selectTelegramConfig(&cfg, "/telegram");
+    if (!build_options.enable_channel_telegram) {
+        try std.testing.expect(selected == null);
+        return;
+    }
     try std.testing.expect(selected != null);
     try std.testing.expectEqualStrings("default", selected.?.account_id);
 }
@@ -2783,6 +2917,10 @@ test "selectWhatsAppConfig picks account by verify_token" {
         },
     };
     const selected = selectWhatsAppConfig(&cfg, null, "verify-b");
+    if (!build_options.enable_channel_whatsapp) {
+        try std.testing.expect(selected == null);
+        return;
+    }
     try std.testing.expect(selected != null);
     try std.testing.expectEqualStrings("backup", selected.?.account_id);
 }
@@ -2817,6 +2955,11 @@ test "selectLineConfigBySignature matches account and rejects bad signature" {
     const signature = std.base64.standard.Encoder.encode(&sig_buf, &mac);
 
     const selected = selectLineConfigBySignature(&cfg, body, signature);
+    if (!build_options.enable_channel_line) {
+        try std.testing.expect(selected == null);
+        try std.testing.expect(selectLineConfigBySignature(&cfg, body, "invalid-signature") == null);
+        return;
+    }
     try std.testing.expect(selected != null);
     try std.testing.expectEqualStrings("backup", selected.?.account_id);
     try std.testing.expect(selectLineConfigBySignature(&cfg, body, "invalid-signature") == null);
@@ -2847,6 +2990,10 @@ test "selectLarkConfig picks account by verification token" {
     };
     const body = "{\"header\":{\"token\":\"token-b\"}}";
     const selected = selectLarkConfig(&cfg, body);
+    if (!build_options.enable_channel_lark) {
+        try std.testing.expect(selected == null);
+        return;
+    }
     try std.testing.expect(selected != null);
     try std.testing.expectEqualStrings("backup", selected.?.account_id);
 }
@@ -3297,6 +3444,13 @@ test "userFacingAgentError maps NoResponseContent" {
     );
 }
 
+test "userFacingAgentError maps AllProvidersFailed" {
+    try std.testing.expectEqualStrings(
+        "All configured providers failed for this request. Check model/provider compatibility and credentials.",
+        userFacingAgentError(error.AllProvidersFailed),
+    );
+}
+
 test "userFacingAgentError maps generic error fallback" {
     try std.testing.expectEqualStrings(
         "An error occurred. Try again.",
@@ -3308,6 +3462,13 @@ test "userFacingAgentErrorJson maps NoResponseContent" {
     try std.testing.expectEqualStrings(
         "{\"error\":\"model returned empty response\"}",
         userFacingAgentErrorJson(error.NoResponseContent),
+    );
+}
+
+test "userFacingAgentErrorJson maps AllProvidersFailed" {
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"all providers failed for this request\"}",
+        userFacingAgentErrorJson(error.AllProvidersFailed),
     );
 }
 
@@ -3559,6 +3720,13 @@ test "hasSlackHttpEndpoint respects mode and webhook_path" {
         },
     };
 
+    if (!build_options.enable_channel_slack) {
+        try std.testing.expect(!hasSlackHttpEndpoint(&cfg, "/slack/custom"));
+        try std.testing.expect(!hasSlackHttpEndpoint(&cfg, "/slack/events"));
+        try std.testing.expect(!hasSlackHttpEndpoint(&cfg, "/line"));
+        return;
+    }
+
     try std.testing.expect(hasSlackHttpEndpoint(&cfg, "/slack/custom"));
     try std.testing.expect(!hasSlackHttpEndpoint(&cfg, "/slack/events"));
     try std.testing.expect(!hasSlackHttpEndpoint(&cfg, "/line"));
@@ -3617,6 +3785,10 @@ test "findSlackConfigForRequest selects account by verified signature" {
     };
 
     const selected = findSlackConfigForRequest(std.testing.allocator, &cfg, "/slack/events", body, ts, &sig_buf);
+    if (!build_options.enable_channel_slack) {
+        try std.testing.expect(selected == null);
+        return;
+    }
     try std.testing.expect(selected != null);
     try std.testing.expectEqualStrings("b", selected.?.account_id);
 }
@@ -3749,4 +3921,140 @@ test "GatewayState event_bus defaults to null" {
     var gs = GatewayState.init(std.testing.allocator);
     defer gs.deinit();
     try std.testing.expect(gs.event_bus == null);
+}
+
+// ── jsonEscapeInto tests ────────────────────────────────────────
+
+fn escapeToString(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try jsonEscapeInto(w, input);
+    return buf.toOwnedSlice(allocator);
+}
+
+test "jsonEscapeInto escapes double quotes" {
+    const result = try escapeToString(std.testing.allocator, "hello \"world\"");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("hello \\\"world\\\"", result);
+}
+
+test "jsonEscapeInto escapes backslashes" {
+    const result = try escapeToString(std.testing.allocator, "path\\to\\file");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("path\\\\to\\\\file", result);
+}
+
+test "jsonEscapeInto escapes newlines and tabs" {
+    const result = try escapeToString(std.testing.allocator, "line1\nline2\ttab");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("line1\\nline2\\ttab", result);
+}
+
+test "jsonEscapeInto escapes control chars as unicode" {
+    // 0x00, 0x01, 0x1F
+    const result = try escapeToString(std.testing.allocator, &[_]u8{ 0x00, 0x01, 0x1F });
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("\\u0000\\u0001\\u001f", result);
+}
+
+test "jsonEscapeInto empty string yields empty output" {
+    const result = try escapeToString(std.testing.allocator, "");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "jsonEscapeInto passes through unicode and emoji unchanged" {
+    const result = try escapeToString(std.testing.allocator, "hello \xc3\xa9\xf0\x9f\x98\x80 world");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("hello \xc3\xa9\xf0\x9f\x98\x80 world", result);
+}
+
+test "jsonEscapeInto escapes carriage return" {
+    const result = try escapeToString(std.testing.allocator, "hello\r\nworld");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("hello\\r\\nworld", result);
+}
+
+test "jsonEscapeInto escapes backspace and form feed" {
+    const result = try escapeToString(std.testing.allocator, "a\x08b\x0Cc");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("a\\bb\\fc", result);
+}
+
+test "jsonEscapeInto mixed special characters" {
+    const result = try escapeToString(std.testing.allocator, "He said \"hi\\there\"\nnew line");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("He said \\\"hi\\\\there\\\"\\nnew line", result);
+}
+
+// ── jsonWrapField tests ─────────────────────────────────────────
+
+test "jsonWrapField produces valid JSON string field" {
+    const result = try jsonWrapField(std.testing.allocator, "msg", "hello \"world\"");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("\"msg\":\"hello \\\"world\\\"\"", result);
+}
+
+test "jsonWrapField with empty value" {
+    const result = try jsonWrapField(std.testing.allocator, "key", "");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("\"key\":\"\"", result);
+}
+
+test "jsonWrapField result is valid JSON when wrapped in braces" {
+    const field = try jsonWrapField(std.testing.allocator, "response", "test\nvalue");
+    defer std.testing.allocator.free(field);
+    // Wrap in object: {"response":"test\nvalue"}
+    const json = try std.fmt.allocPrint(std.testing.allocator, "{{{s}}}", .{field});
+    defer std.testing.allocator.free(json);
+    // Parse to verify it's valid JSON
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const val = parsed.value.object.get("response") orelse unreachable;
+    try std.testing.expect(val == .string);
+    try std.testing.expectEqualStrings("test\nvalue", val.string);
+}
+
+// ── jsonWrapResponse tests ──────────────────────────────────────
+
+test "jsonWrapResponse produces valid JSON with escaped content" {
+    const result = try jsonWrapResponse(std.testing.allocator, "Hello \"user\"\nLine 2");
+    defer std.testing.allocator.free(result);
+    // Verify it's valid JSON
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const status = parsed.value.object.get("status") orelse unreachable;
+    try std.testing.expectEqualStrings("ok", status.string);
+    const response = parsed.value.object.get("response") orelse unreachable;
+    try std.testing.expectEqualStrings("Hello \"user\"\nLine 2", response.string);
+}
+
+test "jsonWrapResponse with clean input" {
+    const result = try jsonWrapResponse(std.testing.allocator, "simple reply");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("{\"status\":\"ok\",\"response\":\"simple reply\"}", result);
+}
+
+// ── jsonWrapChallenge tests ─────────────────────────────────────
+
+test "jsonWrapChallenge produces valid JSON" {
+    const result = try jsonWrapChallenge(std.testing.allocator, "abc123");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("{\"challenge\":\"abc123\"}", result);
+}
+
+test "jsonWrapChallenge escapes malicious challenge value" {
+    const result = try jsonWrapChallenge(std.testing.allocator, "abc\",\"evil\":\"true");
+    defer std.testing.allocator.free(result);
+    // Must be valid JSON with the value properly escaped
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const challenge = parsed.value.object.get("challenge") orelse unreachable;
+    try std.testing.expectEqualStrings("abc\",\"evil\":\"true", challenge.string);
+    // Must NOT have an "evil" key (injection prevented)
+    try std.testing.expect(parsed.value.object.get("evil") == null);
 }

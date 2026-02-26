@@ -2,6 +2,7 @@ const std = @import("std");
 const root = @import("root.zig");
 const sse = @import("sse.zig");
 const error_classify = @import("error_classify.zig");
+const config_types = @import("../config_types.zig");
 
 const Provider = root.Provider;
 const ChatMessage = root.ChatMessage;
@@ -25,7 +26,7 @@ pub const AnthropicProvider = struct {
 
     const DEFAULT_BASE_URL = "https://api.anthropic.com";
     const API_VERSION = "2023-06-01";
-    const DEFAULT_MAX_TOKENS: u32 = 4096;
+    const DEFAULT_MAX_TOKENS: u32 = config_types.DEFAULT_MODEL_MAX_TOKENS;
 
     pub fn init(allocator: std.mem.Allocator, api_key: ?[]const u8, base_url: ?[]const u8) AnthropicProvider {
         const url = if (base_url) |u| trimTrailingSlash(u) else DEFAULT_BASE_URL;
@@ -423,8 +424,9 @@ fn buildChatRequestBody(
     try buf.appendSlice(allocator, "{\"model\":\"");
     try buf.appendSlice(allocator, model);
     try buf.appendSlice(allocator, "\",\"max_tokens\":");
+    const max_tokens = request.max_tokens orelse AnthropicProvider.DEFAULT_MAX_TOKENS;
     var max_buf: [16]u8 = undefined;
-    const max_str = std.fmt.bufPrint(&max_buf, "{d}", .{request.max_tokens orelse 4096}) catch return error.AnthropicApiError;
+    const max_str = std.fmt.bufPrint(&max_buf, "{d}", .{max_tokens}) catch return error.AnthropicApiError;
     try buf.appendSlice(allocator, max_str);
 
     if (system_prompt) |sys| {
@@ -489,8 +491,9 @@ fn buildStreamingChatRequestBody(
     try buf.appendSlice(allocator, "{\"model\":\"");
     try buf.appendSlice(allocator, model);
     try buf.appendSlice(allocator, "\",\"max_tokens\":");
+    const max_tokens = request.max_tokens orelse AnthropicProvider.DEFAULT_MAX_TOKENS;
     var max_buf2: [16]u8 = undefined;
-    const max_str = std.fmt.bufPrint(&max_buf2, "{d}", .{request.max_tokens orelse 4096}) catch return error.AnthropicApiError;
+    const max_str = std.fmt.bufPrint(&max_buf2, "{d}", .{max_tokens}) catch return error.AnthropicApiError;
     try buf.appendSlice(allocator, max_str);
 
     if (system_prompt) |sys| {
@@ -871,6 +874,20 @@ test "buildStreamingChatRequestBody contains stream true" {
     const body = try buildStreamingChatRequestBody(allocator, req, "claude-3-opus", 0.7);
     defer allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
+}
+
+test "buildChatRequestBody defaults max_tokens to runtime fallback" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+    const req = root.ChatRequest{ .messages = &msgs };
+    const body = try buildChatRequestBody(allocator, req, "claude-3-opus", 0.7);
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const max_tokens = parsed.value.object.get("max_tokens").?;
+    try std.testing.expect(max_tokens == .integer);
+    try std.testing.expectEqual(@as(i64, config_types.DEFAULT_MODEL_MAX_TOKENS), max_tokens.integer);
 }
 
 test "buildStreamingChatRequestBody contains same messages as non-streaming" {

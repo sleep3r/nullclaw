@@ -1,6 +1,7 @@
 const std = @import("std");
 const json_util = @import("../json_util.zig");
 const http_util = @import("../http_util.zig");
+const config_types = @import("../config_types.zig");
 const root = @import("root.zig");
 const ToolSpec = root.ToolSpec;
 
@@ -22,7 +23,7 @@ pub fn complete(allocator: std.mem.Allocator, cfg: anytype, prompt: []const u8) 
     const api_key = resolveApiKeyFromCfg(cfg) orelse return error.NoApiKey;
     const url = providerUrl(cfg.default_provider);
     const model = cfg.default_model orelse return error.NoDefaultModel;
-    const body_str = try buildRequestBody(allocator, model, prompt, cfg.temperature, cfg.max_tokens orelse 4096);
+    const body_str = try buildRequestBody(allocator, model, prompt, cfg.temperature, cfg.max_tokens orelse config_types.DEFAULT_MODEL_MAX_TOKENS);
     defer allocator.free(body_str);
 
     var auth_buf: [512]u8 = undefined;
@@ -56,7 +57,7 @@ pub fn completeWithSystem(allocator: std.mem.Allocator, cfg: anytype, system_pro
     const api_key = resolveApiKeyFromCfg(cfg) orelse return error.NoApiKey;
     const url = providerUrl(cfg.default_provider);
     const model = cfg.default_model orelse return error.NoDefaultModel;
-    const max_tok: u32 = if (cfg.max_tokens) |mt| @intCast(@min(mt, std.math.maxInt(u32))) else 4096;
+    const max_tok: u32 = if (cfg.max_tokens) |mt| @intCast(@min(mt, std.math.maxInt(u32))) else config_types.DEFAULT_MODEL_MAX_TOKENS;
     const body_str = try buildRequestBodyWithSystem(allocator, model, system_prompt, prompt, cfg.temperature, max_tok);
     defer allocator.free(body_str);
 

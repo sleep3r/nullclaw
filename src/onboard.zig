@@ -9,12 +9,15 @@
 //!   - Provider/model selection with curated defaults
 
 const std = @import("std");
+const build_options = @import("build_options");
 const platform = @import("platform.zig");
 const config_mod = @import("config.zig");
 const Config = config_mod.Config;
 const channel_catalog = @import("channel_catalog.zig");
 const memory_root = @import("memory/root.zig");
 const http_util = @import("http_util.zig");
+const json_util = @import("json_util.zig");
+const util = @import("util.zig");
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -31,6 +34,29 @@ const BANNER =
     \\
 ;
 
+const WORKSPACE_STATE_DIR = ".nullclaw";
+const WORKSPACE_STATE_FILE = "workspace-state.json";
+const WORKSPACE_STATE_VERSION: i64 = 1;
+
+const WorkspaceOnboardingState = struct {
+    version: i64 = WORKSPACE_STATE_VERSION,
+    bootstrap_seeded_at: ?[]const u8 = null,
+    onboarding_completed_at: ?[]const u8 = null,
+
+    fn deinit(self: *WorkspaceOnboardingState, allocator: std.mem.Allocator) void {
+        if (self.bootstrap_seeded_at) |ts| allocator.free(ts);
+        if (self.onboarding_completed_at) |ts| allocator.free(ts);
+        self.* = .{};
+    }
+};
+
+const WORKSPACE_AGENTS_TEMPLATE = @embedFile("workspace_templates/AGENTS.md");
+const WORKSPACE_SOUL_TEMPLATE = @embedFile("workspace_templates/SOUL.md");
+const WORKSPACE_TOOLS_TEMPLATE = @embedFile("workspace_templates/TOOLS.md");
+const WORKSPACE_IDENTITY_TEMPLATE = @embedFile("workspace_templates/IDENTITY.md");
+const WORKSPACE_USER_TEMPLATE = @embedFile("workspace_templates/USER.md");
+const WORKSPACE_HEARTBEAT_TEMPLATE = @embedFile("workspace_templates/HEARTBEAT.md");
+const WORKSPACE_BOOTSTRAP_TEMPLATE = @embedFile("workspace_templates/BOOTSTRAP.md");
 // ── Project context ──────────────────────────────────────────────
 
 pub const ProjectContext = struct {
@@ -107,21 +133,44 @@ pub fn canonicalProviderName(name: []const u8) []const u8 {
     return name;
 }
 
+fn findProviderInfoByCanonical(name: []const u8) ?ProviderInfo {
+    for (known_providers) |p| {
+        if (std.mem.eql(u8, p.key, name)) return p;
+    }
+    return null;
+}
+
+/// Resolve a provider name used in quick setup.
+/// Accepts aliases (e.g. "grok" -> "xai") and returns provider metadata.
+pub fn resolveProviderForQuickSetup(name: []const u8) ?ProviderInfo {
+    const canonical = canonicalProviderName(name);
+    return findProviderInfoByCanonical(canonical);
+}
+
+pub const ResolveMemoryBackendError = error{
+    UnknownMemoryBackend,
+    MemoryBackendDisabledInBuild,
+};
+
+/// Resolve a memory backend key for quick setup.
+/// Distinguishes "unknown key" from "known but disabled in this build".
+pub fn resolveMemoryBackendForQuickSetup(name: []const u8) ResolveMemoryBackendError!*const memory_root.BackendDescriptor {
+    if (memory_root.findBackend(name)) |desc| return desc;
+    if (memory_root.registry.isKnownBackend(name)) return error.MemoryBackendDisabledInBuild;
+    return error.UnknownMemoryBackend;
+}
+
 /// Get the default model for a provider.
 pub fn defaultModelForProvider(provider: []const u8) []const u8 {
     const canonical = canonicalProviderName(provider);
-    for (known_providers) |p| {
-        if (std.mem.eql(u8, p.key, canonical)) return p.default_model;
-    }
+    if (findProviderInfoByCanonical(canonical)) |p| return p.default_model;
     return "anthropic/claude-sonnet-4.6";
 }
 
 /// Get the environment variable name for a provider's API key.
 pub fn providerEnvVar(provider: []const u8) []const u8 {
     const canonical = canonicalProviderName(provider);
-    for (known_providers) |p| {
-        if (std.mem.eql(u8, p.key, canonical)) return p.env_var;
-    }
+    if (findProviderInfoByCanonical(canonical)) |p| return p.env_var;
     return "API_KEY";
 }
 
@@ -513,17 +562,32 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
     defer cfg.deinit();
 
     // Apply overrides
-    if (provider) |p| cfg.default_provider = p;
+    var provider_overridden = false;
+    if (provider) |p| {
+        const info = resolveProviderForQuickSetup(p) orelse return error.UnknownProvider;
+        cfg.default_provider = try cfg.allocator.dupe(u8, info.key);
+        provider_overridden = true;
+    }
     if (api_key) |key| {
         // Store in providers section for the default provider (arena frees old values)
         const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
-        entries[0] = .{ .name = try cfg.allocator.dupe(u8, cfg.default_provider), .api_key = key };
+        entries[0] = .{
+            .name = try cfg.allocator.dupe(u8, cfg.default_provider),
+            .api_key = try cfg.allocator.dupe(u8, key),
+        };
         cfg.providers = entries;
     }
-    if (memory_backend) |mb| cfg.memory.backend = mb;
+    if (memory_backend) |mb| {
+        const desc = try resolveMemoryBackendForQuickSetup(mb);
+        cfg.memory.backend = desc.name;
+        cfg.memory.profile = memoryProfileForBackend(desc.name);
+        cfg.memory.auto_save = desc.auto_save_default;
+    }
 
     // Set default model based on provider
-    if (cfg.default_model == null or std.mem.eql(u8, cfg.default_model.?, "anthropic/claude-sonnet-4")) {
+    if (provider_overridden) {
+        cfg.default_model = defaultModelForProvider(cfg.default_provider);
+    } else if (cfg.default_model == null or std.mem.eql(u8, cfg.default_model.?, "anthropic/claude-sonnet-4")) {
         cfg.default_model = defaultModelForProvider(cfg.default_provider);
     }
 
@@ -555,7 +619,8 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
     try stdout.print("  [OK] Memory:     {s}\n", .{cfg.memory.backend});
     try stdout.writeAll("\n  Next steps:\n");
     if (cfg.defaultProviderKey() == null) {
-        try stdout.writeAll("    1. Set your API key:  export OPENROUTER_API_KEY=\"sk-...\"\n");
+        const env_hint = providerEnvVar(cfg.default_provider);
+        try stdout.print("    1. Set your API key:  export {s}=\"sk-...\"\n", .{env_hint});
         try stdout.writeAll("    2. Chat:              nullclaw agent -m \"Hello!\"\n");
         try stdout.writeAll("    3. Gateway:           nullclaw gateway\n");
     } else {
@@ -564,6 +629,7 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
         try stdout.writeAll("    3. Status:   nullclaw status\n");
     }
     try stdout.writeAll("\n");
+    try stdout.flush();
 }
 
 /// Main entry point — called from main.zig as `onboard.run(allocator)`.
@@ -576,7 +642,8 @@ pub fn runChannelsOnly(allocator: std.mem.Allocator) !void {
     var stdout_buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&stdout_buf);
     const stdout = &bw.interface;
-    try stdout.writeAll("Channel configuration status:\n\n");
+    var input_buf: [512]u8 = undefined;
+    resetStdinLineReader();
 
     var cfg = Config.load(allocator) catch {
         try stdout.writeAll("No existing config found. Run `nullclaw onboard` first.\n");
@@ -585,23 +652,86 @@ pub fn runChannelsOnly(allocator: std.mem.Allocator) !void {
     };
     defer cfg.deinit();
 
+    try stdout.writeAll("Channel setup wizard:\n");
+    const changed = try configureChannelsInteractive(allocator, &cfg, stdout, &input_buf, "");
+    if (changed) {
+        try cfg.save();
+        try stdout.writeAll("Channel configuration saved.\n\n");
+    } else {
+        try stdout.writeAll("No channel changes applied.\n\n");
+    }
+
+    try stdout.writeAll("Channel configuration status:\n\n");
     for (channel_catalog.known_channels) |meta| {
         var status_buf: [64]u8 = undefined;
         const status_text = channel_catalog.statusText(&cfg, meta, &status_buf);
         try stdout.print("  {s}: {s}\n", .{ meta.label, status_text });
     }
-    try stdout.writeAll("\nTo modify channels, edit your config file:\n");
+    try stdout.writeAll("\nConfig file:\n");
     try stdout.print("  {s}\n", .{cfg.config_path});
     try stdout.flush();
+}
+
+const StdinLineReader = struct {
+    pending: [8192]u8 = undefined,
+    pending_len: usize = 0,
+
+    fn reset(self: *StdinLineReader) void {
+        self.pending_len = 0;
+    }
+
+    fn copyLineToOut(out: []u8, raw_line: []const u8) []const u8 {
+        const trimmed = std.mem.trimRight(u8, raw_line, "\r");
+        const copy_len = @min(out.len, trimmed.len);
+        @memcpy(out[0..copy_len], trimmed[0..copy_len]);
+        return out[0..copy_len];
+    }
+
+    fn popLine(self: *StdinLineReader, out: []u8) ?[]const u8 {
+        const nl = std.mem.indexOfScalar(u8, self.pending[0..self.pending_len], '\n') orelse return null;
+        const line = copyLineToOut(out, self.pending[0..nl]);
+
+        const remainder_start = nl + 1;
+        const remainder_len = self.pending_len - remainder_start;
+        std.mem.copyForwards(u8, self.pending[0..remainder_len], self.pending[remainder_start..self.pending_len]);
+        self.pending_len = remainder_len;
+        return line;
+    }
+
+    fn flushRemainder(self: *StdinLineReader, out: []u8) ?[]const u8 {
+        if (self.pending_len == 0) return null;
+        const line = copyLineToOut(out, self.pending[0..self.pending_len]);
+        self.pending_len = 0;
+        return line;
+    }
+};
+
+var stdin_line_reader = StdinLineReader{};
+
+fn resetStdinLineReader() void {
+    stdin_line_reader.reset();
 }
 
 /// Read a line from stdin, trimming trailing newline/carriage return.
 /// Returns null on EOF (Ctrl+D).
 fn readLine(buf: []u8) ?[]const u8 {
     const stdin = std.fs.File.stdin();
-    const n = stdin.read(buf) catch return null;
-    if (n == 0) return null;
-    return std.mem.trimRight(u8, buf[0..n], "\r\n");
+    while (true) {
+        if (stdin_line_reader.popLine(buf)) |line| return line;
+
+        if (stdin_line_reader.pending_len == stdin_line_reader.pending.len) {
+            // No newline yet and internal buffer is full; return a truncated line
+            // to prevent deadlock on oversized input.
+            return stdin_line_reader.flushRemainder(buf);
+        }
+
+        const read_dst = stdin_line_reader.pending[stdin_line_reader.pending_len..];
+        const n = stdin.read(read_dst) catch return null;
+        if (n == 0) {
+            return stdin_line_reader.flushRemainder(buf);
+        }
+        stdin_line_reader.pending_len += n;
+    }
 }
 
 /// Prompt user with a message, read a line. Returns default_val if input is empty.
@@ -627,12 +757,408 @@ fn promptChoice(out: *std.Io.Writer, buf: []u8, max: usize, default_idx: usize) 
 
 const tunnel_options = [_][]const u8{ "none", "cloudflare", "ngrok", "tailscale" };
 const autonomy_options = [_][]const u8{ "supervised", "autonomous", "fully_autonomous" };
+const wizard_memory_backend_order = [_][]const u8{
+    "sqlite",
+    "markdown",
+    "memory",
+    "none",
+    "lucid",
+    "redis",
+    "lancedb",
+    "postgres",
+    "api",
+};
+
+fn selectableBackendsForWizard(allocator: std.mem.Allocator) ![]const *const memory_root.BackendDescriptor {
+    var out: std.ArrayListUnmanaged(*const memory_root.BackendDescriptor) = .empty;
+    errdefer out.deinit(allocator);
+
+    for (wizard_memory_backend_order) |name| {
+        if (memory_root.findBackend(name)) |desc| {
+            try out.append(allocator, desc);
+        }
+    }
+
+    if (out.items.len == 0) return error.NoSelectableBackends;
+    return out.toOwnedSlice(allocator);
+}
+
+fn memoryProfileForBackend(backend: []const u8) []const u8 {
+    if (std.mem.eql(u8, backend, "sqlite")) return "local_keyword";
+    if (std.mem.eql(u8, backend, "markdown")) return "markdown_only";
+    if (std.mem.eql(u8, backend, "postgres")) return "postgres_keyword";
+    if (std.mem.eql(u8, backend, "none")) return "minimal_none";
+    return "custom";
+}
+
+fn isWizardInteractiveChannel(channel_id: channel_catalog.ChannelId) bool {
+    return switch (channel_id) {
+        .telegram, .discord, .slack, .webhook, .mattermost, .matrix, .signal => true,
+        else => false,
+    };
+}
+
+fn appendUniqueIndex(list: *std.ArrayListUnmanaged(usize), allocator: std.mem.Allocator, idx: usize) !void {
+    for (list.items) |existing| {
+        if (existing == idx) return;
+    }
+    try list.append(allocator, idx);
+}
+
+fn findChannelOptionIndex(token: []const u8, options: []const channel_catalog.ChannelMeta) ?usize {
+    if (std.fmt.parseInt(usize, token, 10)) |num| {
+        if (num >= 1 and num <= options.len) return num - 1;
+    } else |_| {}
+
+    for (options, 0..) |meta, idx| {
+        if (std.ascii.eqlIgnoreCase(meta.key, token)) return idx;
+    }
+    return null;
+}
+
+fn configureChannelsInteractive(
+    allocator: std.mem.Allocator,
+    cfg: *Config,
+    out: *std.Io.Writer,
+    input_buf: []u8,
+    prefix: []const u8,
+) !bool {
+    var options: std.ArrayListUnmanaged(channel_catalog.ChannelMeta) = .empty;
+    defer options.deinit(allocator);
+    var manual_only: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer manual_only.deinit(allocator);
+
+    for (channel_catalog.known_channels) |meta| {
+        if (meta.id == .cli) continue;
+        if (!channel_catalog.isBuildEnabled(meta.id)) continue;
+        if (!isWizardInteractiveChannel(meta.id)) {
+            try manual_only.append(allocator, meta.label);
+            continue;
+        }
+        try options.append(allocator, meta);
+    }
+
+    if (options.items.len == 0) {
+        try out.print("{s}No channel backends are enabled in this build.\n", .{prefix});
+        return false;
+    }
+
+    try out.print("{s}Channel setup:\n", .{prefix});
+    for (options.items, 0..) |meta, idx| {
+        var status_buf: [64]u8 = undefined;
+        const status = channel_catalog.statusText(cfg, meta, &status_buf);
+        try out.print("{s}  [{d}] {s} ({s})\n", .{ prefix, idx + 1, meta.label, status });
+    }
+    if (manual_only.items.len > 0) {
+        try out.print("{s}  Other channels in this build require manual config:", .{prefix});
+        for (manual_only.items) |label| {
+            try out.print(" {s}", .{label});
+        }
+        try out.print("\n", .{});
+    }
+    try out.print("{s}Select channels (comma-separated numbers/keys, Enter to skip): ", .{prefix});
+
+    const selection_input = prompt(out, input_buf, "", "") orelse {
+        try out.print("\n{s}Channel setup aborted.\n", .{prefix});
+        return false;
+    };
+    if (selection_input.len == 0) {
+        try out.print("{s}-> Skipped channel setup.\n", .{prefix});
+        return false;
+    }
+
+    var selected: std.ArrayListUnmanaged(usize) = .empty;
+    defer selected.deinit(allocator);
+
+    var tokens = std.mem.tokenizeAny(u8, selection_input, ", \t");
+    while (tokens.next()) |token| {
+        if (findChannelOptionIndex(token, options.items)) |idx| {
+            try appendUniqueIndex(&selected, allocator, idx);
+        } else {
+            try out.print("{s}  ! Unknown channel '{s}' (ignored)\n", .{ prefix, token });
+        }
+    }
+
+    if (selected.items.len == 0) {
+        try out.print("{s}-> No valid channel selections.\n", .{prefix});
+        return false;
+    }
+
+    var changed = false;
+    for (selected.items) |idx| {
+        const meta = options.items[idx];
+        const configured = try configureSingleChannel(cfg, out, input_buf, prefix, meta);
+        changed = changed or configured;
+    }
+    return changed;
+}
+
+fn configureSingleChannel(
+    cfg: *Config,
+    out: *std.Io.Writer,
+    input_buf: []u8,
+    prefix: []const u8,
+    meta: channel_catalog.ChannelMeta,
+) !bool {
+    return switch (meta.id) {
+        .telegram => configureTelegramChannel(cfg, out, input_buf, prefix),
+        .discord => configureDiscordChannel(cfg, out, input_buf, prefix),
+        .slack => configureSlackChannel(cfg, out, input_buf, prefix),
+        .matrix => configureMatrixChannel(cfg, out, input_buf, prefix),
+        .mattermost => configureMattermostChannel(cfg, out, input_buf, prefix),
+        .signal => configureSignalChannel(cfg, out, input_buf, prefix),
+        .webhook => configureWebhookChannel(cfg, out, input_buf, prefix),
+        else => blk: {
+            try out.print("{s}  {s}: interactive setup not implemented yet. Edit {s} manually.\n", .{ prefix, meta.label, cfg.config_path });
+            break :blk false;
+        },
+    };
+}
+
+fn parseTelegramAllowFrom(allocator: std.mem.Allocator, raw: []const u8) ![]const []const u8 {
+    var allow: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (allow.items) |entry| allocator.free(entry);
+        allow.deinit(allocator);
+    }
+
+    var tokens = std.mem.tokenizeAny(u8, raw, ", \t");
+    while (tokens.next()) |token| {
+        var normalized = std.mem.trim(u8, token, " \t\r\n");
+        if (normalized.len == 0) continue;
+        if (normalized[0] == '@') {
+            normalized = normalized[1..];
+            if (normalized.len == 0) continue;
+        }
+
+        var exists = false;
+        for (allow.items) |existing| {
+            if (std.ascii.eqlIgnoreCase(existing, normalized)) {
+                exists = true;
+                break;
+            }
+        }
+        if (exists) continue;
+
+        try allow.append(allocator, try allocator.dupe(u8, normalized));
+    }
+
+    if (allow.items.len == 0) {
+        try allow.append(allocator, try allocator.dupe(u8, "*"));
+    }
+
+    return allow.toOwnedSlice(allocator);
+}
+
+fn configureTelegramChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, prefix: []const u8) !bool {
+    var token_buf: [512]u8 = undefined;
+    try out.print("{s}  Telegram bot token (required, Enter to skip): ", .{prefix});
+    const token = prompt(out, &token_buf, "", "") orelse return false;
+    if (token.len == 0) {
+        try out.print("{s}  -> Telegram skipped\n", .{prefix});
+        return false;
+    }
+
+    try out.print("{s}  Telegram allow_from (username/user_id, comma-separated) [*]: ", .{prefix});
+    const allow_input = prompt(out, input_buf, "", "") orelse return false;
+    const allow_from = try parseTelegramAllowFrom(cfg.allocator, allow_input);
+
+    const accounts = try cfg.allocator.alloc(config_mod.TelegramConfig, 1);
+    accounts[0] = .{
+        .account_id = "default",
+        .bot_token = try cfg.allocator.dupe(u8, token),
+        .allow_from = allow_from,
+    };
+    cfg.channels.telegram = accounts;
+    if (allow_from.len == 1 and std.mem.eql(u8, allow_from[0], "*")) {
+        try out.print("{s}  -> Telegram configured (allow_from=*)\n", .{prefix});
+    } else {
+        try out.print("{s}  -> Telegram configured ({d} allow_from entries)\n", .{ prefix, allow_from.len });
+    }
+    return true;
+}
+
+fn configureDiscordChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, prefix: []const u8) !bool {
+    var token_buf: [512]u8 = undefined;
+    try out.print("{s}  Discord bot token (required, Enter to skip): ", .{prefix});
+    const token = prompt(out, &token_buf, "", "") orelse return false;
+    if (token.len == 0) {
+        try out.print("{s}  -> Discord skipped\n", .{prefix});
+        return false;
+    }
+
+    try out.print("{s}  Discord guild ID (optional): ", .{prefix});
+    const guild_id = prompt(out, input_buf, "", "") orelse return false;
+
+    const accounts = try cfg.allocator.alloc(config_mod.DiscordConfig, 1);
+    accounts[0] = .{
+        .account_id = "default",
+        .token = try cfg.allocator.dupe(u8, token),
+        .guild_id = if (guild_id.len > 0) try cfg.allocator.dupe(u8, guild_id) else null,
+    };
+    cfg.channels.discord = accounts;
+    try out.print("{s}  -> Discord configured\n", .{prefix});
+    return true;
+}
+
+fn configureSlackChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, prefix: []const u8) !bool {
+    var bot_token_buf: [512]u8 = undefined;
+    var app_token_buf: [512]u8 = undefined;
+    try out.print("{s}  Slack bot token (required, Enter to skip): ", .{prefix});
+    const bot_token = prompt(out, &bot_token_buf, "", "") orelse return false;
+    if (bot_token.len == 0) {
+        try out.print("{s}  -> Slack skipped\n", .{prefix});
+        return false;
+    }
+
+    try out.print("{s}  Slack app token (optional, for socket mode): ", .{prefix});
+    const app_token = prompt(out, &app_token_buf, "", "") orelse return false;
+
+    var signing_secret: ?[]const u8 = null;
+    if (app_token.len == 0) {
+        try out.print("{s}  Slack signing secret (optional, for HTTP mode): ", .{prefix});
+        const secret = prompt(out, input_buf, "", "") orelse return false;
+        if (secret.len > 0) signing_secret = try cfg.allocator.dupe(u8, secret);
+    }
+
+    const accounts = try cfg.allocator.alloc(config_mod.SlackConfig, 1);
+    accounts[0] = .{
+        .account_id = "default",
+        .mode = if (app_token.len > 0) .socket else .http,
+        .bot_token = try cfg.allocator.dupe(u8, bot_token),
+        .app_token = if (app_token.len > 0) try cfg.allocator.dupe(u8, app_token) else null,
+        .signing_secret = signing_secret,
+    };
+    cfg.channels.slack = accounts;
+    try out.print("{s}  -> Slack configured\n", .{prefix});
+    return true;
+}
+
+fn configureMattermostChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, prefix: []const u8) !bool {
+    var base_url_buf: [512]u8 = undefined;
+    try out.print("{s}  Mattermost base URL (required, Enter to skip): ", .{prefix});
+    const base_url = prompt(out, &base_url_buf, "", "") orelse return false;
+    if (base_url.len == 0) {
+        try out.print("{s}  -> Mattermost skipped\n", .{prefix});
+        return false;
+    }
+
+    try out.print("{s}  Mattermost bot token (required, Enter to skip): ", .{prefix});
+    const bot_token = prompt(out, input_buf, "", "") orelse return false;
+    if (bot_token.len == 0) {
+        try out.print("{s}  -> Mattermost skipped\n", .{prefix});
+        return false;
+    }
+
+    const accounts = try cfg.allocator.alloc(config_mod.MattermostConfig, 1);
+    accounts[0] = .{
+        .account_id = "default",
+        .bot_token = try cfg.allocator.dupe(u8, bot_token),
+        .base_url = try cfg.allocator.dupe(u8, base_url),
+    };
+    cfg.channels.mattermost = accounts;
+    try out.print("{s}  -> Mattermost configured\n", .{prefix});
+    return true;
+}
+
+fn configureMatrixChannel(cfg: *Config, out: *std.Io.Writer, _: []u8, prefix: []const u8) !bool {
+    var homeserver_buf: [512]u8 = undefined;
+    var access_token_buf: [512]u8 = undefined;
+    var room_id_buf: [512]u8 = undefined;
+    var user_id_buf: [512]u8 = undefined;
+    try out.print("{s}  Matrix homeserver URL (required, Enter to skip): ", .{prefix});
+    const homeserver = prompt(out, &homeserver_buf, "", "") orelse return false;
+    if (homeserver.len == 0) {
+        try out.print("{s}  -> Matrix skipped\n", .{prefix});
+        return false;
+    }
+
+    try out.print("{s}  Matrix access token (required, Enter to skip): ", .{prefix});
+    const access_token = prompt(out, &access_token_buf, "", "") orelse return false;
+    if (access_token.len == 0) {
+        try out.print("{s}  -> Matrix skipped\n", .{prefix});
+        return false;
+    }
+
+    try out.print("{s}  Matrix room ID (required, Enter to skip): ", .{prefix});
+    const room_id = prompt(out, &room_id_buf, "", "") orelse return false;
+    if (room_id.len == 0) {
+        try out.print("{s}  -> Matrix skipped\n", .{prefix});
+        return false;
+    }
+
+    try out.print("{s}  Matrix user ID (optional, for typing indicators): ", .{prefix});
+    const user_id = prompt(out, &user_id_buf, "", "") orelse return false;
+
+    const accounts = try cfg.allocator.alloc(config_mod.MatrixConfig, 1);
+    accounts[0] = .{
+        .account_id = "default",
+        .homeserver = try cfg.allocator.dupe(u8, homeserver),
+        .access_token = try cfg.allocator.dupe(u8, access_token),
+        .room_id = try cfg.allocator.dupe(u8, room_id),
+        .user_id = if (user_id.len > 0) try cfg.allocator.dupe(u8, user_id) else null,
+        .allow_from = &[_][]const u8{"*"},
+    };
+    cfg.channels.matrix = accounts;
+    try out.print("{s}  -> Matrix configured (allow_from=*)\n", .{prefix});
+    return true;
+}
+
+fn configureSignalChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, prefix: []const u8) !bool {
+    var http_url_buf: [512]u8 = undefined;
+    var account_buf: [512]u8 = undefined;
+    try out.print("{s}  Signal daemon URL [http://127.0.0.1:8080]: ", .{prefix});
+    const http_url = prompt(out, &http_url_buf, "", "http://127.0.0.1:8080") orelse return false;
+    if (http_url.len == 0) {
+        try out.print("{s}  -> Signal skipped\n", .{prefix});
+        return false;
+    }
+
+    try out.print("{s}  Signal account (E.164, required, Enter to skip): ", .{prefix});
+    const account = prompt(out, &account_buf, "", "") orelse return false;
+    if (account.len == 0) {
+        try out.print("{s}  -> Signal skipped\n", .{prefix});
+        return false;
+    }
+
+    try out.print("{s}  Ignore attachments? [y/N]: ", .{prefix});
+    const ignore_input = prompt(out, input_buf, "", "n") orelse return false;
+    const ignore_attachments = ignore_input.len > 0 and (ignore_input[0] == 'y' or ignore_input[0] == 'Y');
+
+    const accounts = try cfg.allocator.alloc(config_mod.SignalConfig, 1);
+    accounts[0] = .{
+        .account_id = "default",
+        .http_url = try cfg.allocator.dupe(u8, http_url),
+        .account = try cfg.allocator.dupe(u8, account),
+        .allow_from = &[_][]const u8{"*"},
+        .ignore_attachments = ignore_attachments,
+    };
+    cfg.channels.signal = accounts;
+    try out.print("{s}  -> Signal configured (allow_from=*)\n", .{prefix});
+    return true;
+}
+
+fn configureWebhookChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, prefix: []const u8) !bool {
+    try out.print("{s}  Webhook port [8080]: ", .{prefix});
+    const port_input = prompt(out, input_buf, "", "8080") orelse return false;
+    const port = std.fmt.parseInt(u16, port_input, 10) catch 8080;
+
+    try out.print("{s}  Webhook secret (optional): ", .{prefix});
+    const secret_input = prompt(out, input_buf, "", "") orelse return false;
+    cfg.channels.webhook = .{
+        .port = port,
+        .secret = if (secret_input.len > 0) try cfg.allocator.dupe(u8, secret_input) else null,
+    };
+    try out.print("{s}  -> Webhook configured\n", .{prefix});
+    return true;
+}
 
 /// Interactive wizard entry point — runs the full setup interactively.
 pub fn runWizard(allocator: std.mem.Allocator) !void {
     var stdout_buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&stdout_buf);
     const out = &bw.interface;
+    resetStdinLineReader();
     try out.writeAll(BANNER);
     try out.writeAll("  Welcome to nullclaw -- the fastest, smallest AI assistant.\n");
     try out.writeAll("  This wizard will configure your agent.\n\n");
@@ -724,7 +1250,8 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     try out.print("  -> {s}\n\n", .{cfg.default_model.?});
 
     // ── Step 4: Memory backend ──
-    const backends = selectableBackends();
+    const backends = try selectableBackendsForWizard(allocator);
+    defer allocator.free(backends);
     try out.writeAll("  Step 4/8: Memory backend\n");
     for (backends, 0..) |b, i| {
         try out.print("    [{d}] {s}\n", .{ i + 1, b.label });
@@ -735,7 +1262,8 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
         try out.flush();
         return;
     };
-    cfg.memory.backend = backends[mem_idx].key;
+    cfg.memory.backend = backends[mem_idx].name;
+    cfg.memory.profile = memoryProfileForBackend(backends[mem_idx].name);
     cfg.memory.auto_save = backends[mem_idx].auto_save_default;
     try out.print("  -> {s}\n\n", .{backends[mem_idx].label});
 
@@ -760,23 +1288,42 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
         try out.flush();
         return;
     };
-    cfg.autonomy.level = switch (autonomy_idx) {
-        0 => .supervised,
-        1 => .read_only,
-        2 => .full,
-        else => .supervised,
-    };
+    switch (autonomy_idx) {
+        0 => {
+            cfg.autonomy.level = .supervised;
+            cfg.autonomy.require_approval_for_medium_risk = true;
+            cfg.autonomy.block_high_risk_commands = true;
+        },
+        1 => {
+            // "autonomous": fully acts, but still blocks high-risk commands.
+            cfg.autonomy.level = .full;
+            cfg.autonomy.require_approval_for_medium_risk = false;
+            cfg.autonomy.block_high_risk_commands = true;
+        },
+        2 => {
+            // "fully_autonomous": fully acts and does not hard-block high-risk commands.
+            cfg.autonomy.level = .full;
+            cfg.autonomy.require_approval_for_medium_risk = false;
+            cfg.autonomy.block_high_risk_commands = false;
+        },
+        else => {
+            cfg.autonomy.level = .supervised;
+            cfg.autonomy.require_approval_for_medium_risk = true;
+            cfg.autonomy.block_high_risk_commands = true;
+        },
+    }
     try out.print("  -> {s}\n\n", .{autonomy_options[autonomy_idx]});
 
     // ── Step 7: Channels ──
-    try out.writeAll("  Step 7/8: Configure channels now? [y/N]: ");
-    const chan_input = prompt(out, &input_buf, "", "n") orelse {
+    try out.writeAll("  Step 7/8: Configure channels now? [Y/n]: ");
+    const chan_input = prompt(out, &input_buf, "", "y") orelse {
         try out.writeAll("\n  Aborted.\n");
         try out.flush();
         return;
     };
     if (chan_input.len > 0 and (chan_input[0] == 'y' or chan_input[0] == 'Y')) {
-        try out.writeAll("  -> Edit channels in config file after setup.\n\n");
+        _ = try configureChannelsInteractive(allocator, &cfg, out, &input_buf, "  ");
+        try out.writeAll("\n");
     } else {
         try out.writeAll("  -> Skipped (CLI enabled by default)\n\n");
     }
@@ -984,6 +1531,17 @@ pub fn runModelsRefresh(allocator: std.mem.Allocator) !void {
 
 /// Create essential workspace files if they don't already exist.
 pub fn scaffoldWorkspace(allocator: std.mem.Allocator, workspace_dir: []const u8, ctx: *const ProjectContext) !void {
+    if (std.fs.path.dirname(workspace_dir)) |parent| {
+        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+    std.fs.makeDirAbsolute(workspace_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
     // MEMORY.md
     const mem_tmpl = try memoryTemplate(allocator, ctx);
     defer allocator.free(mem_tmpl);
@@ -1013,8 +1571,9 @@ pub fn scaffoldWorkspace(allocator: std.mem.Allocator, workspace_dir: []const u8
     // HEARTBEAT.md (periodic tasks — loaded by prompt.zig)
     try writeIfMissing(allocator, workspace_dir, "HEARTBEAT.md", heartbeatTemplate());
 
-    // BOOTSTRAP.md (startup instructions — loaded by prompt.zig)
-    try writeIfMissing(allocator, workspace_dir, "BOOTSTRAP.md", bootstrapTemplate());
+    // BOOTSTRAP.md lifecycle:
+    // one-shot onboarding instructions with persisted state marker.
+    try ensureBootstrapLifecycle(allocator, workspace_dir, identity_tmpl, user_tmpl);
 
     // Ensure memory/ subdirectory
     const mem_dir = try std.fmt.allocPrint(allocator, "{s}/memory", .{workspace_dir});
@@ -1033,16 +1592,244 @@ fn writeIfMissing(allocator: std.mem.Allocator, dir: []const u8, filename: []con
     if (std.fs.openFileAbsolute(path, .{})) |f| {
         f.close();
         return;
-    } else |_| {}
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
 
-    const file = std.fs.createFileAbsolute(path, .{}) catch return;
+    const file = std.fs.createFileAbsolute(path, .{ .exclusive = true }) catch |err| switch (err) {
+        error.PathAlreadyExists => return,
+        else => return err,
+    };
     defer file.close();
-    file.writeAll(content) catch {};
+    try file.writeAll(content);
+}
+
+fn ensureBootstrapLifecycle(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    identity_template: []const u8,
+    user_template: []const u8,
+) !void {
+    const bootstrap_path = try std.fmt.allocPrint(allocator, "{s}/BOOTSTRAP.md", .{workspace_dir});
+    defer allocator.free(bootstrap_path);
+
+    var state = try readWorkspaceOnboardingState(allocator, workspace_dir);
+    defer state.deinit(allocator);
+    var state_dirty = false;
+    var bootstrap_exists = fileExistsAbsolute(bootstrap_path);
+
+    if (state.bootstrap_seeded_at == null and bootstrap_exists) {
+        try markBootstrapSeededAt(allocator, &state);
+        state_dirty = true;
+    }
+
+    if (state.onboarding_completed_at == null and state.bootstrap_seeded_at != null and !bootstrap_exists) {
+        try markOnboardingCompletedAt(allocator, &state);
+        state_dirty = true;
+    }
+
+    if (state.bootstrap_seeded_at == null and state.onboarding_completed_at == null and !bootstrap_exists) {
+        const legacy_completed = try isLegacyOnboardingCompleted(
+            allocator,
+            workspace_dir,
+            identity_template,
+            user_template,
+        );
+        if (legacy_completed) {
+            try markOnboardingCompletedAt(allocator, &state);
+            state_dirty = true;
+        } else {
+            try writeIfMissing(allocator, workspace_dir, "BOOTSTRAP.md", bootstrapTemplate());
+            bootstrap_exists = fileExistsAbsolute(bootstrap_path);
+            if (bootstrap_exists and state.bootstrap_seeded_at == null) {
+                try markBootstrapSeededAt(allocator, &state);
+                state_dirty = true;
+            }
+        }
+    }
+
+    if (state_dirty) {
+        try writeWorkspaceOnboardingState(allocator, workspace_dir, &state);
+    }
+}
+
+fn isLegacyOnboardingCompleted(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    identity_template: []const u8,
+    user_template: []const u8,
+) !bool {
+    const identity_path = try std.fmt.allocPrint(allocator, "{s}/IDENTITY.md", .{workspace_dir});
+    defer allocator.free(identity_path);
+    const user_path = try std.fmt.allocPrint(allocator, "{s}/USER.md", .{workspace_dir});
+    defer allocator.free(user_path);
+
+    const identity_content = try readFileIfPresent(allocator, identity_path, 1024 * 1024) orelse return false;
+    defer allocator.free(identity_content);
+    const user_content = try readFileIfPresent(allocator, user_path, 1024 * 1024) orelse return false;
+    defer allocator.free(user_content);
+
+    return !std.mem.eql(u8, identity_content, identity_template) or
+        !std.mem.eql(u8, user_content, user_template);
+}
+
+fn workspaceStatePath(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}/{s}",
+        .{ workspace_dir, WORKSPACE_STATE_DIR, WORKSPACE_STATE_FILE },
+    );
+}
+
+fn readWorkspaceOnboardingState(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+) !WorkspaceOnboardingState {
+    const path = try workspaceStatePath(allocator, workspace_dir);
+    defer allocator.free(path);
+
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return .{},
+        else => return err,
+    };
+    defer file.close();
+
+    const raw = file.readToEndAlloc(allocator, 64 * 1024) catch return .{};
+    defer allocator.free(raw);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return .{};
+    defer parsed.deinit();
+
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return .{},
+    };
+
+    var state = WorkspaceOnboardingState{};
+    errdefer state.deinit(allocator);
+
+    if (obj.get("version")) |v| {
+        switch (v) {
+            .integer => |n| {
+                if (n > 0) state.version = n;
+            },
+            else => {},
+        }
+    }
+
+    if (obj.get("bootstrap_seeded_at")) |v| {
+        switch (v) {
+            .string => |s| state.bootstrap_seeded_at = try allocator.dupe(u8, s),
+            else => {},
+        }
+    } else if (obj.get("bootstrapSeededAt")) |v| {
+        switch (v) {
+            .string => |s| state.bootstrap_seeded_at = try allocator.dupe(u8, s),
+            else => {},
+        }
+    }
+
+    if (obj.get("onboarding_completed_at")) |v| {
+        switch (v) {
+            .string => |s| state.onboarding_completed_at = try allocator.dupe(u8, s),
+            else => {},
+        }
+    } else if (obj.get("onboardingCompletedAt")) |v| {
+        switch (v) {
+            .string => |s| state.onboarding_completed_at = try allocator.dupe(u8, s),
+            else => {},
+        }
+    }
+
+    return state;
+}
+
+fn writeWorkspaceOnboardingState(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    state: *const WorkspaceOnboardingState,
+) !void {
+    const path = try workspaceStatePath(allocator, workspace_dir);
+    defer allocator.free(path);
+
+    if (std.fs.path.dirname(path)) |parent| {
+        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "{\n  ");
+    try json_util.appendJsonInt(&buf, allocator, "version", state.version);
+    if (state.bootstrap_seeded_at) |seeded| {
+        try buf.appendSlice(allocator, ",\n  ");
+        try json_util.appendJsonKey(&buf, allocator, "bootstrap_seeded_at");
+        try json_util.appendJsonString(&buf, allocator, seeded);
+    }
+    if (state.onboarding_completed_at) |completed| {
+        try buf.appendSlice(allocator, ",\n  ");
+        try json_util.appendJsonKey(&buf, allocator, "onboarding_completed_at");
+        try json_util.appendJsonString(&buf, allocator, completed);
+    }
+    try buf.appendSlice(allocator, "\n}\n");
+
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp_path);
+
+    const tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
+    errdefer tmp_file.close();
+    try tmp_file.writeAll(buf.items);
+    tmp_file.close();
+
+    std.fs.renameAbsolute(tmp_path, path) catch {
+        std.fs.deleteFileAbsolute(tmp_path) catch {};
+        const file = try std.fs.createFileAbsolute(path, .{});
+        defer file.close();
+        try file.writeAll(buf.items);
+    };
+}
+
+fn readFileIfPresent(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) !?[]u8 {
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer file.close();
+    return try file.readToEndAlloc(allocator, max_bytes);
+}
+
+fn fileExistsAbsolute(path: []const u8) bool {
+    const file = std.fs.openFileAbsolute(path, .{}) catch return false;
+    file.close();
+    return true;
+}
+
+fn makeIsoTimestamp(allocator: std.mem.Allocator) ![]u8 {
+    var ts_buf: [32]u8 = undefined;
+    const ts = util.timestamp(&ts_buf);
+    return allocator.dupe(u8, ts);
+}
+
+fn markBootstrapSeededAt(allocator: std.mem.Allocator, state: *WorkspaceOnboardingState) !void {
+    if (state.bootstrap_seeded_at != null) return;
+    state.bootstrap_seeded_at = try makeIsoTimestamp(allocator);
+}
+
+fn markOnboardingCompletedAt(allocator: std.mem.Allocator, state: *WorkspaceOnboardingState) !void {
+    if (state.onboarding_completed_at != null) return;
+    state.onboarding_completed_at = try makeIsoTimestamp(allocator);
 }
 
 fn memoryTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) ![]const u8 {
     return std.fmt.allocPrint(allocator,
-        \\# {s}'s Memory
+        \\# MEMORY.md - Long-Term Memory
+        \\
+        \\This file stores curated, durable context for main sessions.
+        \\Prefer high-signal facts over raw logs.
         \\
         \\## User
         \\- Name: {s}
@@ -1051,115 +1838,58 @@ fn memoryTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) ![]c
         \\## Preferences
         \\- Communication style: {s}
         \\
-    , .{ ctx.agent_name, ctx.user_name, ctx.timezone, ctx.communication_style });
+        \\## Durable facts
+        \\- Add stable preferences, decisions, and constraints here.
+        \\- Keep secrets out unless explicitly requested.
+        \\- Move noisy daily notes to memory/YYYY-MM-DD.md.
+        \\
+        \\## Agent
+        \\- Name: {s}
+        \\
+    , .{ ctx.user_name, ctx.timezone, ctx.communication_style, ctx.agent_name });
 }
 
 fn soulTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) ![]const u8 {
-    return std.fmt.allocPrint(allocator,
-        \\# Soul
-        \\
-        \\You are {s} — a fast, lightweight AI assistant powered by nullclaw.
-        \\
-        \\## Personality
-        \\- Efficient and focused
-        \\- Prefer action over discussion
-        \\- Honest about limitations
-        \\- Respect the user's time
-        \\
-    , .{ctx.agent_name});
+    _ = ctx;
+    return allocator.dupe(u8, WORKSPACE_SOUL_TEMPLATE);
 }
 
 fn agentsTemplate() []const u8 {
-    return 
-    \\# Agent Guidelines
-    \\
-    \\## Tool Use
-    \\- Use tools when you need information or to perform actions
-    \\- Prefer reading files before modifying them
-    \\- Validate tool results before proceeding
-    \\
-    \\## Conversation
-    \\- Keep responses concise and actionable
-    \\- Show code when relevant
-    \\- Ask clarifying questions when requirements are ambiguous
-    \\
-    ;
+    return WORKSPACE_AGENTS_TEMPLATE;
 }
 
 fn toolsTemplate() []const u8 {
-    return 
-    \\# Tools Guide
-    \\
-    \\## File Operations
-    \\- Use file_read to inspect files before editing
-    \\- Use file_write for creating new files
-    \\- Use file_edit for modifying existing files (find-replace)
-    \\
-    \\## Shell
-    \\- Use shell for commands, builds, and tests
-    \\- Prefer non-destructive commands
-    \\- Be cautious with rm, overwrite, and network operations
-    \\
-    ;
+    return WORKSPACE_TOOLS_TEMPLATE;
 }
 
 fn identityTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) ![]const u8 {
-    return std.fmt.allocPrint(allocator,
-        \\# Identity
-        \\
-        \\name: {s}
-        \\engine: nullclaw
-        \\version: 0.1.0
-        \\
-    , .{ctx.agent_name});
+    _ = ctx;
+    return allocator.dupe(u8, WORKSPACE_IDENTITY_TEMPLATE);
 }
 
 fn userTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) ![]const u8 {
-    return std.fmt.allocPrint(allocator,
-        \\# User Profile
-        \\
-        \\- Name: {s}
-        \\- Timezone: {s}
-        \\- Style: {s}
-        \\
-    , .{ ctx.user_name, ctx.timezone, ctx.communication_style });
+    _ = ctx;
+    return allocator.dupe(u8, WORKSPACE_USER_TEMPLATE);
 }
 
 fn heartbeatTemplate() []const u8 {
-    return 
-    \\# Heartbeat
-    \\
-    \\Periodic tasks and reminders. Add items below to be checked regularly.
-    \\
-    \\## Tasks
-    \\(none configured)
-    \\
-    ;
+    return WORKSPACE_HEARTBEAT_TEMPLATE;
 }
 
 fn bootstrapTemplate() []const u8 {
-    return 
-    \\# Bootstrap
-    \\
-    \\Startup instructions executed when the agent initializes.
-    \\
-    \\## On Start
-    \\- Load workspace context
-    \\- Check for pending tasks
-    \\
-    ;
+    return WORKSPACE_BOOTSTRAP_TEMPLATE;
 }
 
 // ── Memory backend helpers ───────────────────────────────────────
 
-/// Get the list of selectable memory backends.
-pub fn selectableBackends() []const memory_root.MemoryBackendProfile {
-    return &memory_root.selectable_backends;
+/// Get the list of selectable memory backends (from registry).
+pub fn selectableBackends() []const memory_root.BackendDescriptor {
+    return &memory_root.registry.all;
 }
 
 /// Get the default memory backend key.
 pub fn defaultBackendKey() []const u8 {
-    return memory_root.defaultBackendKey();
+    return "markdown";
 }
 
 // ── Path helpers ─────────────────────────────────────────────────
@@ -1217,10 +1947,111 @@ test "known_providers has entries" {
     try std.testing.expectEqualStrings("openrouter", known_providers[0].key);
 }
 
-test "selectableBackends returns non-empty" {
+test "selectableBackends returns enabled backends" {
     const backends = selectableBackends();
-    try std.testing.expect(backends.len >= 3);
-    try std.testing.expectEqualStrings("sqlite", backends[0].key);
+    try std.testing.expect(backends.len > 0);
+
+    for (backends) |desc| {
+        try std.testing.expect(memory_root.findBackend(desc.name) != null);
+    }
+
+    if (memory_root.findBackend("markdown") != null) {
+        try std.testing.expectEqualStrings("markdown", backends[0].name);
+    } else if (memory_root.findBackend("none") != null) {
+        try std.testing.expectEqualStrings("none", backends[0].name);
+    }
+}
+
+test "selectableBackendsForWizard prioritizes sqlite and keeps api last" {
+    const backends = try selectableBackendsForWizard(std.testing.allocator);
+    defer std.testing.allocator.free(backends);
+
+    if (memory_root.findBackend("sqlite") != null) {
+        try std.testing.expectEqualStrings("sqlite", backends[0].name);
+    }
+    if (memory_root.findBackend("sqlite") != null and memory_root.findBackend("markdown") != null and backends.len >= 2) {
+        try std.testing.expectEqualStrings("markdown", backends[1].name);
+    }
+    if (memory_root.findBackend("api") != null) {
+        try std.testing.expectEqualStrings("api", backends[backends.len - 1].name);
+    }
+}
+
+test "memoryProfileForBackend maps common backends" {
+    try std.testing.expectEqualStrings("local_keyword", memoryProfileForBackend("sqlite"));
+    try std.testing.expectEqualStrings("markdown_only", memoryProfileForBackend("markdown"));
+    try std.testing.expectEqualStrings("postgres_keyword", memoryProfileForBackend("postgres"));
+    try std.testing.expectEqualStrings("minimal_none", memoryProfileForBackend("none"));
+    try std.testing.expectEqualStrings("custom", memoryProfileForBackend("api"));
+    try std.testing.expectEqualStrings("custom", memoryProfileForBackend("memory"));
+    try std.testing.expectEqualStrings("custom", memoryProfileForBackend("redis"));
+}
+
+test "isWizardInteractiveChannel includes supported onboarding channels" {
+    try std.testing.expect(isWizardInteractiveChannel(.telegram));
+    try std.testing.expect(isWizardInteractiveChannel(.slack));
+    try std.testing.expect(isWizardInteractiveChannel(.matrix));
+    try std.testing.expect(isWizardInteractiveChannel(.signal));
+    try std.testing.expect(!isWizardInteractiveChannel(.whatsapp));
+}
+
+test "parseTelegramAllowFrom defaults to wildcard" {
+    const allow = try parseTelegramAllowFrom(std.testing.allocator, "");
+    defer {
+        for (allow) |entry| std.testing.allocator.free(entry);
+        std.testing.allocator.free(allow);
+    }
+    try std.testing.expectEqual(@as(usize, 1), allow.len);
+    try std.testing.expectEqualStrings("*", allow[0]);
+}
+
+test "parseTelegramAllowFrom normalizes, deduplicates and strips @" {
+    const allow = try parseTelegramAllowFrom(std.testing.allocator, " @Alice, alice  12345, @bob ");
+    defer {
+        for (allow) |entry| std.testing.allocator.free(entry);
+        std.testing.allocator.free(allow);
+    }
+    try std.testing.expectEqual(@as(usize, 3), allow.len);
+    try std.testing.expectEqualStrings("Alice", allow[0]);
+    try std.testing.expectEqualStrings("12345", allow[1]);
+    try std.testing.expectEqualStrings("bob", allow[2]);
+}
+
+test "StdinLineReader popLine handles chunked multi-line input" {
+    var reader = StdinLineReader{};
+    var out: [64]u8 = undefined;
+
+    const chunk1 = "first\nsecond";
+    @memcpy(reader.pending[0..chunk1.len], chunk1);
+    reader.pending_len = chunk1.len;
+
+    const line1 = reader.popLine(&out) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("first", line1);
+    try std.testing.expect(reader.popLine(&out) == null);
+
+    const chunk2 = "\nthird\r\n";
+    @memcpy(reader.pending[reader.pending_len .. reader.pending_len + chunk2.len], chunk2);
+    reader.pending_len += chunk2.len;
+
+    const line2 = reader.popLine(&out) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("second", line2);
+    const line3 = reader.popLine(&out) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("third", line3);
+    try std.testing.expect(reader.popLine(&out) == null);
+}
+
+test "StdinLineReader flushRemainder returns final unterminated line" {
+    var reader = StdinLineReader{};
+    var out: [32]u8 = undefined;
+
+    const tail = "last-line\r";
+    @memcpy(reader.pending[0..tail.len], tail);
+    reader.pending_len = tail.len;
+
+    const line = reader.flushRemainder(&out) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("last-line", line);
+    try std.testing.expectEqual(@as(usize, 0), reader.pending_len);
+    try std.testing.expect(reader.flushRemainder(&out) == null);
 }
 
 test "BANNER contains descriptive text" {
@@ -1244,6 +2075,12 @@ test "scaffoldWorkspace creates files in temp dir" {
     defer std.testing.allocator.free(content);
     try std.testing.expect(content.len > 0);
     try std.testing.expect(std.mem.indexOf(u8, content, "Memory") != null);
+
+    const agents = try tmp.dir.openFile("AGENTS.md", .{});
+    defer agents.close();
+    const agents_content = try agents.readToEndAlloc(std.testing.allocator, 16 * 1024);
+    defer std.testing.allocator.free(agents_content);
+    try std.testing.expect(std.mem.indexOf(u8, agents_content, "AGENTS.md - Your Workspace") != null);
 }
 
 test "scaffoldWorkspace is idempotent" {
@@ -1259,6 +2096,86 @@ test "scaffoldWorkspace is idempotent" {
     try scaffoldWorkspace(std.testing.allocator, base, &ctx);
 }
 
+test "scaffoldWorkspace seeds bootstrap marker for new workspace" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+
+    const bootstrap_file = try tmp.dir.openFile("BOOTSTRAP.md", .{});
+    bootstrap_file.close();
+
+    var state = try readWorkspaceOnboardingState(std.testing.allocator, base);
+    defer state.deinit(std.testing.allocator);
+    try std.testing.expect(state.bootstrap_seeded_at != null);
+    try std.testing.expect(state.onboarding_completed_at == null);
+}
+
+test "scaffoldWorkspace does not recreate BOOTSTRAP after onboarding completion" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+
+    {
+        const f = try tmp.dir.createFile("IDENTITY.md", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("custom identity");
+    }
+    {
+        const f = try tmp.dir.createFile("USER.md", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("custom user");
+    }
+
+    try tmp.dir.deleteFile("BOOTSTRAP.md");
+    try tmp.dir.deleteFile("TOOLS.md");
+
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
+    const tools_file = try tmp.dir.openFile("TOOLS.md", .{});
+    tools_file.close();
+
+    var state = try readWorkspaceOnboardingState(std.testing.allocator, base);
+    defer state.deinit(std.testing.allocator);
+    try std.testing.expect(state.onboarding_completed_at != null);
+}
+
+test "scaffoldWorkspace does not seed BOOTSTRAP for legacy completed workspace" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("IDENTITY.md", .{});
+        defer f.close();
+        try f.writeAll("custom identity");
+    }
+    {
+        const f = try tmp.dir.createFile("USER.md", .{});
+        defer f.close();
+        try f.writeAll("custom user");
+    }
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
+
+    var state = try readWorkspaceOnboardingState(std.testing.allocator, base);
+    defer state.deinit(std.testing.allocator);
+    try std.testing.expect(state.bootstrap_seeded_at == null);
+    try std.testing.expect(state.onboarding_completed_at != null);
+}
+
 // ── Additional onboard tests ────────────────────────────────────
 
 test "canonicalProviderName passthrough for known providers" {
@@ -1272,6 +2189,49 @@ test "canonicalProviderName passthrough for known providers" {
 test "canonicalProviderName unknown returns as-is" {
     try std.testing.expectEqualStrings("my-custom-provider", canonicalProviderName("my-custom-provider"));
     try std.testing.expectEqualStrings("", canonicalProviderName(""));
+}
+
+test "resolveProviderForQuickSetup handles known and alias names" {
+    const openrouter = resolveProviderForQuickSetup("openrouter") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("openrouter", openrouter.key);
+
+    const grok_alias = resolveProviderForQuickSetup("grok") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("xai", grok_alias.key);
+}
+
+test "resolveProviderForQuickSetup rejects unknown provider" {
+    try std.testing.expect(resolveProviderForQuickSetup("totally-unknown-provider") == null);
+}
+
+test "resolveMemoryBackendForQuickSetup validates enabled, disabled and unknown backends" {
+    // Unknown key should always fail as unknown.
+    try std.testing.expectError(
+        error.UnknownMemoryBackend,
+        resolveMemoryBackendForQuickSetup("totally-unknown-backend"),
+    );
+
+    // Enabled backend resolves to descriptor.
+    if (memory_root.findBackend("markdown")) |desc| {
+        const resolved = try resolveMemoryBackendForQuickSetup("markdown");
+        try std.testing.expectEqualStrings(desc.name, resolved.name);
+    } else {
+        try std.testing.expectError(
+            error.MemoryBackendDisabledInBuild,
+            resolveMemoryBackendForQuickSetup("markdown"),
+        );
+    }
+
+    // If the current build has at least one known-but-disabled backend,
+    // ensure we return the explicit disabled error for it.
+    for (memory_root.registry.known_backend_names) |name| {
+        if (memory_root.findBackend(name) == null) {
+            try std.testing.expectError(
+                error.MemoryBackendDisabledInBuild,
+                resolveMemoryBackendForQuickSetup(name),
+            );
+            return;
+        }
+    }
 }
 
 test "defaultModelForProvider gemini via alias" {
@@ -1374,12 +2334,12 @@ test "defaultBackendKey returns non-empty" {
 
 test "selectableBackends has expected backends" {
     const backends = selectableBackends();
-    // Should have sqlite, markdown, and json at minimum
+    // SQLite is optional and controlled by build flag.
     var has_sqlite = false;
     for (backends) |b| {
-        if (std.mem.eql(u8, b.key, "sqlite")) has_sqlite = true;
+        if (std.mem.eql(u8, b.name, "sqlite")) has_sqlite = true;
     }
-    try std.testing.expect(has_sqlite);
+    try std.testing.expectEqual(build_options.enable_memory_sqlite, has_sqlite);
 }
 
 // ── Wizard helper tests ─────────────────────────────────────────
@@ -1440,12 +2400,23 @@ test "wizard promptChoice returns default for out-of-range" {
     // The wizard would clamp to default (0) for out of range input
 }
 
+test "findChannelOptionIndex supports number and key" {
+    const options = [_]channel_catalog.ChannelMeta{
+        .{ .id = .telegram, .key = "telegram", .label = "Telegram", .configured_message = "Telegram configured", .listener_mode = .polling },
+        .{ .id = .discord, .key = "discord", .label = "Discord", .configured_message = "Discord configured", .listener_mode = .gateway_loop },
+    };
+
+    try std.testing.expectEqual(@as(?usize, 0), findChannelOptionIndex("1", &options));
+    try std.testing.expectEqual(@as(?usize, 1), findChannelOptionIndex("discord", &options));
+    try std.testing.expect(findChannelOptionIndex("unknown", &options) == null);
+}
+
 test "wizard maps autonomy index to enum correctly" {
     // Verify the mapping used in runWizard
     const Config2 = @import("config.zig");
-    const mapping = [_]Config2.AutonomyLevel{ .supervised, .read_only, .full };
+    const mapping = [_]Config2.AutonomyLevel{ .supervised, .full, .full };
     try std.testing.expect(mapping[0] == .supervised);
-    try std.testing.expect(mapping[1] == .read_only);
+    try std.testing.expect(mapping[1] == .full);
     try std.testing.expect(mapping[2] == .full);
 }
 
@@ -1454,45 +2425,45 @@ test "wizard maps autonomy index to enum correctly" {
 test "soulTemplate contains personality" {
     const tmpl = try soulTemplate(std.testing.allocator, &ProjectContext{});
     defer std.testing.allocator.free(tmpl);
-    try std.testing.expect(std.mem.indexOf(u8, tmpl, "Soul") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tmpl, "nullclaw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "SOUL.md - Who You Are") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "Core Truths") != null);
 }
 
 test "agentsTemplate contains guidelines" {
     const tmpl = agentsTemplate();
-    try std.testing.expect(std.mem.indexOf(u8, tmpl, "Agent Guidelines") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tmpl, "Tool Use") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "AGENTS.md - Your Workspace") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "Every Session") != null);
 }
 
 test "toolsTemplate contains tool docs" {
     const tmpl = toolsTemplate();
-    try std.testing.expect(std.mem.indexOf(u8, tmpl, "Tools Guide") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tmpl, "Shell") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "TOOLS.md - Local Notes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "Skills define _how_ tools work") != null);
 }
 
 test "identityTemplate contains agent name" {
     const tmpl = try identityTemplate(std.testing.allocator, &ProjectContext{ .agent_name = "TestBot" });
     defer std.testing.allocator.free(tmpl);
-    try std.testing.expect(std.mem.indexOf(u8, tmpl, "TestBot") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tmpl, "nullclaw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "IDENTITY.md - Who Am I?") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "**Name:**") != null);
 }
 
 test "userTemplate contains user info" {
     const ctx = ProjectContext{ .user_name = "Alice", .timezone = "PST" };
     const tmpl = try userTemplate(std.testing.allocator, &ctx);
     defer std.testing.allocator.free(tmpl);
-    try std.testing.expect(std.mem.indexOf(u8, tmpl, "Alice") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tmpl, "PST") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "USER.md - About Your Human") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "Learn about the person you're helping") != null);
 }
 
 test "heartbeatTemplate is non-empty" {
     const tmpl = heartbeatTemplate();
-    try std.testing.expect(std.mem.indexOf(u8, tmpl, "Heartbeat") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "HEARTBEAT.md") != null);
 }
 
 test "bootstrapTemplate is non-empty" {
     const tmpl = bootstrapTemplate();
-    try std.testing.expect(std.mem.indexOf(u8, tmpl, "Bootstrap") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "BOOTSTRAP.md - Hello, World") != null);
 }
 
 test "scaffoldWorkspace creates all prompt.zig files" {

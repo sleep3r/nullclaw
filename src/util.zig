@@ -44,6 +44,31 @@ test "timestamp produces valid length" {
     try std.testing.expectEqual(@as(usize, 20), ts.len);
 }
 
+// ── JSON helpers ────────────────────────────────────────────────
+
+/// Append a string to an ArrayList with JSON escaping (quotes, backslashes, control chars).
+/// Used by embedding providers, vector stores, and API backends when building JSON payloads.
+pub fn appendJsonEscaped(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, text: []const u8) !void {
+    for (text) |ch| {
+        switch (ch) {
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            '\n' => try buf.appendSlice(allocator, "\\n"),
+            '\r' => try buf.appendSlice(allocator, "\\r"),
+            '\t' => try buf.appendSlice(allocator, "\\t"),
+            else => {
+                if (ch < 0x20) {
+                    var hex_buf: [6]u8 = undefined;
+                    const hex = std.fmt.bufPrint(&hex_buf, "\\u{x:0>4}", .{ch}) catch continue;
+                    try buf.appendSlice(allocator, hex);
+                } else {
+                    try buf.append(allocator, ch);
+                }
+            },
+        }
+    }
+}
+
 // ── Additional util tests ───────────────────────────────────────
 
 test "formatBytes zero" {
@@ -104,4 +129,32 @@ test "timestamp contains T separator" {
     var buf: [32]u8 = undefined;
     const ts = timestamp(&buf);
     try std.testing.expect(std.mem.indexOf(u8, ts, "T") != null);
+}
+
+test "appendJsonEscaped basic text" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try appendJsonEscaped(&buf, std.testing.allocator, "hello world");
+    try std.testing.expectEqualStrings("hello world", buf.items);
+}
+
+test "appendJsonEscaped escapes special chars" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try appendJsonEscaped(&buf, std.testing.allocator, "say \"hello\"\nnewline\\backslash");
+    try std.testing.expectEqualStrings("say \\\"hello\\\"\\nnewline\\\\backslash", buf.items);
+}
+
+test "appendJsonEscaped escapes control chars" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try appendJsonEscaped(&buf, std.testing.allocator, "tab\there\rreturn");
+    try std.testing.expectEqualStrings("tab\\there\\rreturn", buf.items);
+}
+
+test "appendJsonEscaped empty string" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try appendJsonEscaped(&buf, std.testing.allocator, "");
+    try std.testing.expectEqual(@as(usize, 0), buf.items.len);
 }

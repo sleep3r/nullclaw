@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const yc = @import("nullclaw");
 
 pub fn panic(msg: []const u8, error_return_trace: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {
@@ -16,7 +17,6 @@ const log = std.log.scoped(.main);
 const Command = enum {
     agent,
     gateway,
-    daemon,
     service,
     status,
     version,
@@ -27,6 +27,8 @@ const Command = enum {
     skills,
     hardware,
     migrate,
+    memory,
+    capabilities,
     models,
     auth,
     update,
@@ -37,7 +39,6 @@ fn parseCommand(arg: []const u8) ?Command {
     const command_map = std.StaticStringMap(Command).initComptime(.{
         .{ "agent", .agent },
         .{ "gateway", .gateway },
-        .{ "daemon", .daemon },
         .{ "service", .service },
         .{ "status", .status },
         .{ "version", .version },
@@ -50,6 +51,8 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "skills", .skills },
         .{ "hardware", .hardware },
         .{ "migrate", .migrate },
+        .{ "memory", .memory },
+        .{ "capabilities", .capabilities },
         .{ "models", .models },
         .{ "auth", .auth },
         .{ "update", .update },
@@ -92,13 +95,14 @@ pub fn main() !void {
         .doctor => try yc.doctor.run(allocator),
         .help => printUsage(),
         .gateway => try runGateway(allocator, sub_args),
-        .daemon => try runDaemon(allocator, sub_args),
         .service => try runService(allocator, sub_args),
         .cron => try runCron(allocator, sub_args),
         .channel => try runChannel(allocator, sub_args),
         .skills => try runSkills(allocator, sub_args),
         .hardware => try runHardware(allocator, sub_args),
         .migrate => try runMigrate(allocator, sub_args),
+        .memory => try runMemory(allocator, sub_args),
+        .capabilities => try runCapabilities(allocator, sub_args),
         .models => try runModels(allocator, sub_args),
         .auth => try runAuth(allocator, sub_args),
         .update => try runUpdate(allocator, sub_args),
@@ -136,28 +140,6 @@ fn applyGatewayDaemonOverrides(cfg: *yc.config.Config, sub_args: []const []const
 // ── Gateway ──────────────────────────────────────────────────────
 
 fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
-    var cfg = yc.config.Config.load(allocator) catch {
-        std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
-        std.process.exit(1);
-    };
-    defer cfg.deinit();
-
-    applyGatewayDaemonOverrides(&cfg, sub_args) catch {
-        std.debug.print("Invalid port in CLI args.\n", .{});
-        std.process.exit(1);
-    };
-
-    cfg.validate() catch |err| {
-        yc.config.Config.printValidationError(err);
-        std.process.exit(1);
-    };
-
-    try yc.daemon.run(allocator, &cfg, cfg.gateway.host, cfg.gateway.port);
-}
-
-// ── Daemon ───────────────────────────────────────────────────────
-
-fn runDaemon(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     var cfg = yc.config.Config.load(allocator) catch {
         std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
         std.process.exit(1);
@@ -342,7 +324,7 @@ fn runChannel(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             \\Commands:
             \\  list                          List configured channels
             \\  start [channel]               Start a channel (default: first available)
-            \\  doctor                        Run health checks
+            \\  status                        Show channel health/status
             \\  add <type> <config_json>      Add a channel
             \\  remove <name>                 Remove a channel
             \\
@@ -367,7 +349,7 @@ fn runChannel(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         }
     } else if (std.mem.eql(u8, subcmd, "start")) {
         try runChannelStart(allocator, sub_args[1..]);
-    } else if (std.mem.eql(u8, subcmd, "doctor")) {
+    } else if (std.mem.eql(u8, subcmd, "status")) {
         std.debug.print("Channel health:\n", .{});
         std.debug.print("  CLI: ok\n", .{});
         for (yc.channel_catalog.known_channels) |meta| {
@@ -565,7 +547,7 @@ fn runMigrate(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             \\Usage: nullclaw migrate <source> [options]
             \\
             \\Sources:
-            \\  openclaw                      Import from OpenClaw workspace
+            \\  openclaw                      Import from OpenClaw workspace (+ config migration)
             \\
             \\Options:
             \\  --dry-run                     Preview without writing
@@ -604,10 +586,320 @@ fn runMigrate(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             std.debug.print("[DRY RUN] ", .{});
         }
         std.debug.print("Migration complete: {d} imported, {d} skipped\n", .{ stats.imported, stats.skipped_unchanged });
+        if (stats.config_migrated) {
+            if (dry_run) {
+                std.debug.print("[DRY RUN] Config migration preview: ~/.openclaw/config.json -> {s}\n", .{cfg.config_path});
+            } else {
+                std.debug.print("Config migrated: ~/.openclaw/config.json -> {s}\n", .{cfg.config_path});
+            }
+        }
     } else {
         std.debug.print("Unknown migration source: {s}\n", .{sub_args[0]});
         std.process.exit(1);
     }
+}
+
+// ── Memory ───────────────────────────────────────────────────────
+
+fn printMemoryUsage() void {
+    std.debug.print(
+        \\Usage: nullclaw memory <command> [args]
+        \\
+        \\Commands:
+        \\  stats                         Show resolved memory config and key counters
+        \\  count                         Show total number of memory entries
+        \\  reindex                       Rebuild vector index from primary memory
+        \\  search <query> [--limit N]    Run runtime retrieval (keyword/hybrid)
+        \\  get <key>                     Show a single memory entry by key
+        \\  list [--category C] [--limit N]
+        \\                                List memory entries (default limit: 20)
+        \\  drain-outbox                  Drain durable vector outbox queue
+        \\  forget <key>                  Delete entry from primary memory (if backend supports)
+        \\
+    , .{});
+}
+
+fn parsePositiveUsize(arg: []const u8) ?usize {
+    const n = std.fmt.parseInt(usize, arg, 10) catch return null;
+    if (n == 0) return null;
+    return n;
+}
+
+fn printMemoryRuntimeInitFailure(allocator: std.mem.Allocator, backend: []const u8) void {
+    const enabled = yc.memory.registry.formatEnabledBackends(allocator) catch null;
+    defer if (enabled) |names| allocator.free(names);
+
+    if (yc.memory.registry.isKnownBackend(backend) and yc.memory.findBackend(backend) == null) {
+        const engine_token = yc.memory.registry.engineTokenForBackend(backend) orelse backend;
+        std.debug.print("Memory backend '{s}' is configured but disabled in this build.\n", .{backend});
+        std.debug.print("Rebuild with -Dengines={s} (or include it in -Dengines=... list).\n", .{engine_token});
+    } else if (!yc.memory.registry.isKnownBackend(backend)) {
+        std.debug.print("Unknown memory backend '{s}'.\n", .{backend});
+        std.debug.print("Known memory backends: {s}\n", .{yc.memory.registry.known_backends_csv});
+    } else {
+        std.debug.print("Memory runtime init failed for backend '{s}'. Check memory config and logs.\n", .{backend});
+    }
+
+    if (enabled) |names| {
+        std.debug.print("Enabled memory backends in this build: {s}\n", .{names});
+    }
+}
+
+fn printRetrievalScoreLine(c: yc.memory.RetrievalCandidate) void {
+    const kw_rank: []const u8 = if (c.keyword_rank != null) "yes" else "no";
+    const vec_score: f32 = c.vector_score orelse -1.0;
+    if (c.vector_score) |_| {
+        std.debug.print("     score={d:.4} keyword_ranked={s} vector_score={d:.4} source={s}\n", .{
+            c.final_score,
+            kw_rank,
+            vec_score,
+            c.source,
+        });
+    } else {
+        std.debug.print("     score={d:.4} keyword_ranked={s} vector_score=n/a source={s}\n", .{
+            c.final_score,
+            kw_rank,
+            c.source,
+        });
+    }
+}
+
+fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    if (sub_args.len < 1) {
+        printMemoryUsage();
+        std.process.exit(1);
+    }
+
+    var cfg = yc.config.Config.load(allocator) catch {
+        std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
+        std.process.exit(1);
+    };
+    defer cfg.deinit();
+
+    var mem_rt = yc.memory.initRuntime(allocator, &cfg.memory, cfg.workspace_dir) orelse {
+        printMemoryRuntimeInitFailure(allocator, cfg.memory.backend);
+        std.process.exit(1);
+    };
+    defer mem_rt.deinit();
+
+    const subcmd = sub_args[0];
+
+    if (std.mem.eql(u8, subcmd, "stats")) {
+        const r = mem_rt.resolved;
+        const report = mem_rt.diagnose();
+        std.debug.print("Memory stats:\n", .{});
+        std.debug.print("  backend: {s}\n", .{r.primary_backend});
+        std.debug.print("  retrieval: {s}\n", .{r.retrieval_mode});
+        std.debug.print("  vector: {s}\n", .{r.vector_mode});
+        std.debug.print("  embedding: {s}\n", .{r.embedding_provider});
+        std.debug.print("  rollout: {s}\n", .{r.rollout_mode});
+        std.debug.print("  sync: {s}\n", .{r.vector_sync_mode});
+        std.debug.print("  sources: {d}\n", .{r.source_count});
+        std.debug.print("  fallback: {s}\n", .{r.fallback_policy});
+        std.debug.print("  entries: {d}\n", .{report.entry_count});
+        if (report.vector_entry_count) |n| {
+            std.debug.print("  vector_entries: {d}\n", .{n});
+        } else {
+            std.debug.print("  vector_entries: n/a\n", .{});
+        }
+        if (report.outbox_pending) |n| {
+            std.debug.print("  outbox_pending: {d}\n", .{n});
+        } else {
+            std.debug.print("  outbox_pending: n/a\n", .{});
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "count")) {
+        const count = mem_rt.memory.count() catch |err| {
+            std.debug.print("memory count failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        std.debug.print("{d}\n", .{count});
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "reindex")) {
+        const count = mem_rt.reindex(allocator);
+        if (std.mem.eql(u8, mem_rt.resolved.vector_mode, "none")) {
+            std.debug.print("Vector plane is disabled; reindex skipped (0 entries).\n", .{});
+        } else {
+            std.debug.print("Reindex complete: {d} entries reindexed.\n", .{count});
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "drain-outbox")) {
+        const drained = mem_rt.drainOutbox(allocator);
+        std.debug.print("Outbox drain complete: {d} operation(s) processed.\n", .{drained});
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "forget")) {
+        if (sub_args.len < 2) {
+            std.debug.print("Usage: nullclaw memory forget <key>\n", .{});
+            std.process.exit(1);
+        }
+        const key = sub_args[1];
+        const deleted = mem_rt.memory.forget(key) catch |err| {
+            std.debug.print("memory forget failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        if (deleted) {
+            mem_rt.deleteFromVectorStore(key);
+            std.debug.print("Deleted memory entry: {s}\n", .{key});
+        } else {
+            std.debug.print("Entry not deleted (missing or backend is append-only): {s}\n", .{key});
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "get")) {
+        if (sub_args.len < 2) {
+            std.debug.print("Usage: nullclaw memory get <key>\n", .{});
+            std.process.exit(1);
+        }
+        const key = sub_args[1];
+        const entry = mem_rt.memory.get(allocator, key) catch |err| {
+            std.debug.print("memory get failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        if (entry) |e| {
+            defer e.deinit(allocator);
+            std.debug.print("key: {s}\ncategory: {s}\ntimestamp: {s}\ncontent:\n{s}\n", .{
+                e.key,
+                e.category.toString(),
+                e.timestamp,
+                e.content,
+            });
+        } else {
+            std.debug.print("Not found: {s}\n", .{key});
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "list")) {
+        var limit: usize = 20;
+        var category_opt: ?yc.memory.MemoryCategory = null;
+
+        var i: usize = 1;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "--limit")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw memory list [--category C] [--limit N]\n", .{});
+                    std.process.exit(1);
+                }
+                i += 1;
+                limit = parsePositiveUsize(sub_args[i]) orelse {
+                    std.debug.print("Invalid --limit value: {s}\n", .{sub_args[i]});
+                    std.process.exit(1);
+                };
+            } else if (std.mem.eql(u8, sub_args[i], "--category")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw memory list [--category C] [--limit N]\n", .{});
+                    std.process.exit(1);
+                }
+                i += 1;
+                category_opt = yc.memory.MemoryCategory.fromString(sub_args[i]);
+            } else {
+                std.debug.print("Unknown option for memory list: {s}\n", .{sub_args[i]});
+                std.process.exit(1);
+            }
+        }
+
+        const entries = mem_rt.memory.list(allocator, category_opt, null) catch |err| {
+            std.debug.print("memory list failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer yc.memory.freeEntries(allocator, entries);
+
+        const shown = @min(limit, entries.len);
+        std.debug.print("Memory entries: showing {d}/{d}\n", .{ shown, entries.len });
+        for (entries[0..shown], 0..) |e, idx| {
+            const preview_len = @min(@as(usize, 120), e.content.len);
+            const preview = e.content[0..preview_len];
+            std.debug.print("  {d}. {s} [{s}] {s}\n     {s}{s}\n", .{
+                idx + 1,
+                e.key,
+                e.category.toString(),
+                e.timestamp,
+                preview,
+                if (e.content.len > preview_len) "..." else "",
+            });
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "search")) {
+        if (sub_args.len < 2) {
+            std.debug.print("Usage: nullclaw memory search <query> [--limit N]\n", .{});
+            std.process.exit(1);
+        }
+        const query = sub_args[1];
+        var limit: usize = 6;
+
+        var i: usize = 2;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "--limit")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw memory search <query> [--limit N]\n", .{});
+                    std.process.exit(1);
+                }
+                i += 1;
+                limit = parsePositiveUsize(sub_args[i]) orelse {
+                    std.debug.print("Invalid --limit value: {s}\n", .{sub_args[i]});
+                    std.process.exit(1);
+                };
+            } else {
+                std.debug.print("Unknown option for memory search: {s}\n", .{sub_args[i]});
+                std.process.exit(1);
+            }
+        }
+
+        const results = mem_rt.search(allocator, query, limit, null) catch |err| {
+            std.debug.print("memory search failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer yc.memory.retrieval.freeCandidates(allocator, results);
+
+        std.debug.print("Search results: {d}\n", .{results.len});
+        for (results, 0..) |c, idx| {
+            std.debug.print("  {d}. {s} [{s}]\n", .{ idx + 1, c.key, c.category.toString() });
+            printRetrievalScoreLine(c);
+            const preview_len = @min(@as(usize, 140), c.snippet.len);
+            const preview = c.snippet[0..preview_len];
+            std.debug.print("     {s}{s}\n", .{ preview, if (c.snippet.len > preview_len) "..." else "" });
+        }
+        return;
+    }
+
+    std.debug.print("Unknown memory command: {s}\n\n", .{subcmd});
+    printMemoryUsage();
+    std.process.exit(1);
+}
+
+fn runCapabilities(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    var as_json = false;
+    if (sub_args.len > 0) {
+        if (sub_args.len == 1 and (std.mem.eql(u8, sub_args[0], "--json") or std.mem.eql(u8, sub_args[0], "json"))) {
+            as_json = true;
+        } else {
+            std.debug.print("Usage: nullclaw capabilities [--json]\n", .{});
+            std.process.exit(1);
+        }
+    }
+
+    var cfg_opt: ?yc.config.Config = yc.config.Config.load(allocator) catch null;
+    defer if (cfg_opt) |*cfg| cfg.deinit();
+    const cfg_ptr: ?*const yc.config.Config = if (cfg_opt) |*cfg| cfg else null;
+
+    const output = if (as_json)
+        try yc.capabilities.buildManifestJson(allocator, cfg_ptr, null)
+    else
+        try yc.capabilities.buildSummaryText(allocator, cfg_ptr, null);
+    defer allocator.free(output);
+
+    std.debug.print("{s}", .{output});
 }
 
 // ── Models ───────────────────────────────────────────────────────
@@ -669,37 +961,175 @@ fn runModels(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
 
 // ── Onboard ──────────────────────────────────────────────────────
 
-fn runOnboard(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
-    var interactive = false;
-    var channels_only = false;
-    var api_key: ?[]const u8 = null;
-    var provider: ?[]const u8 = null;
-    var memory_backend: ?[]const u8 = null;
+const OnboardMode = enum {
+    quick,
+    interactive,
+    channels_only,
+};
+
+const OnboardArgs = struct {
+    mode: OnboardMode = .quick,
+    api_key: ?[]const u8 = null,
+    provider: ?[]const u8 = null,
+    memory_backend: ?[]const u8 = null,
+};
+
+const OnboardArgParseResult = union(enum) {
+    ok: OnboardArgs,
+    unknown_option: []const u8,
+    missing_value: []const u8,
+    unexpected_argument: []const u8,
+    invalid_combination: void,
+};
+
+fn parseOnboardArgs(sub_args: []const []const u8) OnboardArgParseResult {
+    var parsed = OnboardArgs{};
 
     var i: usize = 0;
     while (i < sub_args.len) : (i += 1) {
-        if (std.mem.eql(u8, sub_args[i], "--interactive")) {
-            interactive = true;
-        } else if (std.mem.eql(u8, sub_args[i], "--channels-only")) {
-            channels_only = true;
-        } else if (std.mem.eql(u8, sub_args[i], "--api-key") and i + 1 < sub_args.len) {
-            i += 1;
-            api_key = sub_args[i];
-        } else if (std.mem.eql(u8, sub_args[i], "--provider") and i + 1 < sub_args.len) {
-            i += 1;
-            provider = sub_args[i];
-        } else if (std.mem.eql(u8, sub_args[i], "--memory") and i + 1 < sub_args.len) {
-            i += 1;
-            memory_backend = sub_args[i];
+        const arg = sub_args[i];
+        if (std.mem.eql(u8, arg, "--interactive")) {
+            if (parsed.mode == .channels_only) return .{ .invalid_combination = {} };
+            parsed.mode = .interactive;
+            continue;
         }
+        if (std.mem.eql(u8, arg, "--channels-only")) {
+            if (parsed.mode == .interactive) return .{ .invalid_combination = {} };
+            parsed.mode = .channels_only;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--api-key")) {
+            if (i + 1 >= sub_args.len) return .{ .missing_value = arg };
+            i += 1;
+            parsed.api_key = sub_args[i];
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--provider")) {
+            if (i + 1 >= sub_args.len) return .{ .missing_value = arg };
+            i += 1;
+            parsed.provider = sub_args[i];
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--memory")) {
+            if (i + 1 >= sub_args.len) return .{ .missing_value = arg };
+            i += 1;
+            parsed.memory_backend = sub_args[i];
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, arg, "-")) {
+            return .{ .unknown_option = arg };
+        }
+        return .{ .unexpected_argument = arg };
     }
 
-    if (channels_only) {
-        try yc.onboard.runChannelsOnly(allocator);
-    } else if (interactive) {
-        try yc.onboard.runWizard(allocator);
-    } else {
-        try yc.onboard.runQuickSetup(allocator, api_key, provider, memory_backend);
+    if (parsed.mode != .quick and
+        (parsed.api_key != null or parsed.provider != null or parsed.memory_backend != null))
+    {
+        return .{ .invalid_combination = {} };
+    }
+
+    return .{ .ok = parsed };
+}
+
+fn printOnboardUsage() void {
+    std.debug.print(
+        \\Usage: nullclaw onboard [--interactive | --channels-only | [--api-key KEY] [--provider PROV] [--memory MEM]]
+        \\
+        \\Modes:
+        \\  (default)         quick setup
+        \\  --interactive     run full interactive wizard
+        \\  --channels-only   reconfigure channels and allowlists only
+        \\
+        \\Quick setup options:
+        \\  --api-key KEY     provider API key to persist in config
+        \\  --provider PROV   default provider key (e.g. openrouter, anthropic)
+        \\  --memory MEM      memory backend key (e.g. markdown, sqlite, memory)
+        \\
+        \\Examples:
+        \\  nullclaw onboard --api-key sk-... --provider openrouter
+        \\  nullclaw onboard --interactive
+        \\
+    , .{});
+}
+
+fn printKnownOnboardProviders() void {
+    std.debug.print("Known providers:", .{});
+    for (yc.onboard.known_providers) |p| {
+        std.debug.print(" {s}", .{p.key});
+    }
+    std.debug.print("\n", .{});
+}
+
+fn printEnabledMemoryBackends(allocator: std.mem.Allocator) void {
+    const enabled = yc.memory.registry.formatEnabledBackends(allocator) catch null;
+    defer if (enabled) |names| allocator.free(names);
+
+    if (enabled) |names| {
+        std.debug.print("Enabled memory backends in this build: {s}\n", .{names});
+    }
+}
+
+fn runOnboard(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    if (sub_args.len == 1 and
+        (std.mem.eql(u8, sub_args[0], "--help") or std.mem.eql(u8, sub_args[0], "-h")))
+    {
+        printOnboardUsage();
+        return;
+    }
+
+    const parsed = switch (parseOnboardArgs(sub_args)) {
+        .ok => |args| args,
+        .unknown_option => |opt| {
+            std.debug.print("Unknown onboard option: {s}\n\n", .{opt});
+            printOnboardUsage();
+            std.process.exit(1);
+        },
+        .missing_value => |opt| {
+            std.debug.print("Missing value for onboard option: {s}\n\n", .{opt});
+            printOnboardUsage();
+            std.process.exit(1);
+        },
+        .unexpected_argument => |arg| {
+            std.debug.print("Unexpected positional argument for onboard: {s}\n\n", .{arg});
+            printOnboardUsage();
+            std.process.exit(1);
+        },
+        .invalid_combination => {
+            std.debug.print("Invalid onboard option combination.\n", .{});
+            std.debug.print("Use either --interactive, --channels-only, or quick-setup flags.\n\n", .{});
+            printOnboardUsage();
+            std.process.exit(1);
+        },
+    };
+
+    switch (parsed.mode) {
+        .channels_only => try yc.onboard.runChannelsOnly(allocator),
+        .interactive => try yc.onboard.runWizard(allocator),
+        .quick => yc.onboard.runQuickSetup(allocator, parsed.api_key, parsed.provider, parsed.memory_backend) catch |err| switch (err) {
+            error.UnknownProvider => {
+                const requested = parsed.provider orelse "(missing)";
+                std.debug.print("Unknown provider '{s}' for quick setup.\n", .{requested});
+                printKnownOnboardProviders();
+                std.process.exit(1);
+            },
+            error.UnknownMemoryBackend => {
+                const requested = parsed.memory_backend orelse "(missing)";
+                std.debug.print("Unknown memory backend '{s}' for quick setup.\n", .{requested});
+                std.debug.print("Known memory backends: {s}\n", .{yc.memory.registry.known_backends_csv});
+                printEnabledMemoryBackends(allocator);
+                std.process.exit(1);
+            },
+            error.MemoryBackendDisabledInBuild => {
+                const requested = parsed.memory_backend orelse "(missing)";
+                const engine_token = yc.memory.registry.engineTokenForBackend(requested) orelse requested;
+                std.debug.print("Memory backend '{s}' is disabled in this build.\n", .{requested});
+                std.debug.print("Rebuild with -Dengines={s} (or include it in -Dengines=... list).\n", .{engine_token});
+                printEnabledMemoryBackends(allocator);
+                std.process.exit(1);
+            },
+            else => return err,
+        },
     }
 }
 
@@ -710,6 +1140,7 @@ fn runOnboard(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 // To run all configured channels/accounts together, use `nullclaw gateway`.
 
 fn canStartFromChannelCommand(channel_id: yc.channel_catalog.ChannelId) bool {
+    if (!yc.channel_catalog.isBuildEnabled(channel_id)) return false;
     return switch (channel_id) {
         .cli, .webhook => false,
         else => true,
@@ -731,6 +1162,12 @@ fn dispatchChannelStart(
     config: *const yc.config.Config,
     meta: yc.channel_catalog.ChannelMeta,
 ) !void {
+    if (!yc.channel_catalog.isBuildEnabled(meta.id)) {
+        std.debug.print("{s} channel is disabled in this build.\n", .{meta.label});
+        std.debug.print("Rebuild with -Dchannels={s} (or -Dchannels=all).\n", .{meta.key});
+        std.process.exit(1);
+    }
+
     switch (meta.id) {
         .telegram => {
             if (config.channels.telegramPrimary()) |tg_config| {
@@ -765,6 +1202,46 @@ fn hasConfiguredStartableChannels(config: *const yc.config.Config) bool {
     return false;
 }
 
+fn hasConfiguredButBuildDisabledStartableChannels(config: *const yc.config.Config) bool {
+    for (yc.channel_catalog.known_channels) |meta| {
+        if (meta.id == .cli or meta.id == .webhook) continue;
+        if (yc.channel_catalog.isBuildEnabled(meta.id)) continue;
+        if (yc.channel_catalog.configuredCount(config, meta.id) > 0) return true;
+    }
+    return false;
+}
+
+fn printConfiguredButBuildDisabledChannelsHint(config: *const yc.config.Config) void {
+    std.debug.print("Configured channels are disabled in this build:", .{});
+    var first: bool = true;
+    for (yc.channel_catalog.known_channels) |meta| {
+        if (meta.id == .cli or meta.id == .webhook) continue;
+        if (yc.channel_catalog.isBuildEnabled(meta.id)) continue;
+        if (yc.channel_catalog.configuredCount(config, meta.id) == 0) continue;
+        if (first) {
+            std.debug.print(" {s}", .{meta.key});
+            first = false;
+        } else {
+            std.debug.print(", {s}", .{meta.key});
+        }
+    }
+    std.debug.print("\n", .{});
+    std.debug.print("Rebuild with -Dchannels=all or -Dchannels=", .{});
+    first = true;
+    for (yc.channel_catalog.known_channels) |meta| {
+        if (meta.id == .cli or meta.id == .webhook) continue;
+        if (yc.channel_catalog.isBuildEnabled(meta.id)) continue;
+        if (yc.channel_catalog.configuredCount(config, meta.id) == 0) continue;
+        if (first) {
+            std.debug.print("{s}", .{meta.key});
+            first = false;
+        } else {
+            std.debug.print(",{s}", .{meta.key});
+        }
+    }
+    std.debug.print("\n", .{});
+}
+
 fn printNoMessagingChannelConfiguredHint() void {
     std.debug.print("No messaging channel configured. Add to config.json:\n", .{});
     std.debug.print("  Telegram: {{\"channels\": {{\"telegram\": {{\"accounts\": {{\"main\": {{\"bot_token\": \"...\"}}}}}}}}\n", .{});
@@ -790,7 +1267,11 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
     };
 
     if (!hasConfiguredStartableChannels(&config)) {
-        printNoMessagingChannelConfiguredHint();
+        if (hasConfiguredButBuildDisabledStartableChannels(&config)) {
+            printConfiguredButBuildDisabledChannelsHint(&config);
+        } else {
+            printNoMessagingChannelConfiguredHint();
+        }
         std.process.exit(1);
     }
 
@@ -803,6 +1284,17 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
             printChannelStartSupported();
             std.process.exit(1);
         };
+        if (!yc.channel_catalog.isBuildEnabled(meta.id)) {
+            const configured = yc.channel_catalog.configuredCount(&config, meta.id);
+            if (configured > 0) {
+                std.debug.print("Channel {s} is configured ({d} account(s)) but disabled in this build.\n", .{ meta.key, configured });
+            } else {
+                std.debug.print("Channel {s} is disabled in this build.\n", .{meta.key});
+            }
+            std.debug.print("Rebuild with -Dchannels={s} (or -Dchannels=all).\n", .{meta.key});
+            printChannelStartSupported();
+            std.process.exit(1);
+        }
         if (!canStartFromChannelCommand(meta.id)) {
             std.debug.print("Channel {s} cannot be started via `channel start`.\n", .{ch_name});
             printChannelStartSupported();
@@ -901,6 +1393,10 @@ fn hasReliabilityCredentialFallback(allocator: std.mem.Allocator, config: *const
 
 fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, config: *const yc.config.Config, signal_config: yc.config.SignalConfig) !void {
     _ = args;
+    if (!build_options.enable_channel_signal) {
+        std.debug.print("Signal channel is disabled in this build.\n", .{});
+        std.process.exit(1);
+    }
 
     // Resolve API key: config providers first, then env vars (ANTHROPIC_API_KEY, etc.)
     const resolved_api_key = yc.providers.resolveApiKeyFromConfig(
@@ -1005,6 +1501,9 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         .tracker = &tracker,
     };
 
+    var subagent_manager = yc.subagent.SubagentManager.init(allocator, config, null, .{});
+    defer subagent_manager.deinit();
+
     // Create tools (for system prompt and tool calling)
     const tools = yc.tools.allTools(allocator, config.workspace_dir, .{
         .http_enabled = config.http_request.enabled,
@@ -1016,6 +1515,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         .tools_config = config.tools,
         .allowed_paths = config.autonomy.allowed_paths,
         .policy = &sec_policy,
+        .subagent_manager = &subagent_manager,
     }) catch &.{};
     defer if (tools.len > 0) yc.tools.deinitTools(allocator, tools);
 
@@ -1024,15 +1524,14 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
     }
 
     // Create optional memory backend (don't fail if unavailable)
-    var mem_opt: ?yc.memory.Memory = null;
-    const db_path = std.fs.path.joinZ(allocator, &.{ config.workspace_dir, "memory.db" }) catch null;
-    defer if (db_path) |p| allocator.free(p);
-    if (db_path) |p| {
-        if (yc.memory.createMemory(allocator, config.memory.backend, p)) |mem| {
-            mem_opt = mem;
-        } else |_| {}
+    var mem_rt = yc.memory.initRuntime(allocator, &config.memory, config.workspace_dir);
+    defer if (mem_rt) |*rt| rt.deinit();
+    const mem_opt: ?yc.memory.Memory = if (mem_rt) |rt| rt.memory else null;
+
+    // Wire MemoryRuntime into tools for retrieval pipeline + vector sync
+    if (mem_rt) |*rt| {
+        yc.tools.bindMemoryRuntime(tools, rt);
     }
-    defer if (mem_opt) |m| m.deinit();
 
     // Create provider with reliability wrapper (retry + fallback chains).
     var runtime_provider = try yc.providers.runtime_bundle.RuntimeProviderBundle.init(allocator, config);
@@ -1044,8 +1543,11 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
     const obs = noop_obs.observer();
 
     // Initialize session manager
-    var session_mgr = yc.session.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs);
+    var session_mgr = yc.session.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
     session_mgr.policy = &sec_policy;
+    if (mem_rt) |*rt| {
+        session_mgr.mem_rt = rt;
+    }
     defer session_mgr.deinit();
 
     // Session key buffer
@@ -1096,9 +1598,10 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
             const reply = session_mgr.processMessage(session_key, msg.content) catch |err| {
                 std.debug.print("  Agent error: {}\n", .{err});
                 const err_msg = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError => "Network error. Please try again.",
+                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
                     error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
                     error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
+                    error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
                     error.OutOfMemory => "Out of memory.",
                     else => "An error occurred. Try again or /new for a fresh session.",
                 };
@@ -1141,6 +1644,10 @@ fn runMatrixChannel(
     matrix_config: yc.config.MatrixConfig,
 ) !void {
     _ = args;
+    if (!build_options.enable_channel_matrix) {
+        std.debug.print("Matrix channel is disabled in this build.\n", .{});
+        std.process.exit(1);
+    }
 
     var mx = yc.channels.matrix.MatrixChannel.initFromConfig(allocator, matrix_config);
 
@@ -1182,6 +1689,11 @@ fn runMatrixChannel(
 // ── Telegram Channel ───────────────────────────────────────────────-
 
 fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, config: yc.config.Config, telegram_config: yc.config.TelegramConfig) !void {
+    if (!build_options.enable_channel_telegram) {
+        std.debug.print("Telegram channel is disabled in this build.\n", .{});
+        std.process.exit(1);
+    }
+
     // Determine allowed users: --user CLI args override config allow_from
     var user_list: std.ArrayList([]const u8) = .empty;
     defer user_list.deinit(allocator);
@@ -1280,6 +1792,9 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         .tracker = &tracker,
     };
 
+    var subagent_manager = yc.subagent.SubagentManager.init(allocator, &config, null, .{});
+    defer subagent_manager.deinit();
+
     // Create tools (for system prompt and tool calling)
     const tools = yc.tools.allTools(allocator, config.workspace_dir, .{
         .http_enabled = config.http_request.enabled,
@@ -1291,6 +1806,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         .tools_config = config.tools,
         .allowed_paths = config.autonomy.allowed_paths,
         .policy = &sec_policy,
+        .subagent_manager = &subagent_manager,
     }) catch &.{};
     defer if (tools.len > 0) yc.tools.deinitTools(allocator, tools);
 
@@ -1299,15 +1815,14 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     }
 
     // Create optional memory backend (don't fail if unavailable)
-    var mem_opt: ?yc.memory.Memory = null;
-    const db_path = std.fs.path.joinZ(allocator, &.{ config.workspace_dir, "memory.db" }) catch null;
-    defer if (db_path) |p| allocator.free(p);
-    if (db_path) |p| {
-        if (yc.memory.createMemory(allocator, config.memory.backend, p)) |mem| {
-            mem_opt = mem;
-        } else |_| {}
+    var mem_rt = yc.memory.initRuntime(allocator, &config.memory, config.workspace_dir);
+    defer if (mem_rt) |*rt| rt.deinit();
+    const mem_opt: ?yc.memory.Memory = if (mem_rt) |rt| rt.memory else null;
+
+    // Wire MemoryRuntime into tools for retrieval pipeline + vector sync
+    if (mem_rt) |*rt| {
+        yc.tools.bindMemoryRuntime(tools, rt);
     }
-    defer if (mem_opt) |m| m.deinit();
 
     // Create noop observer
     var noop_obs = yc.observability.NoopObserver{};
@@ -1329,8 +1844,11 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
 
     std.debug.print("  Polling for messages... (Ctrl+C to stop)\n\n", .{});
 
-    var session_mgr = yc.session.SessionManager.init(allocator, &config, provider_i, tools, mem_opt, obs);
+    var session_mgr = yc.session.SessionManager.init(allocator, &config, provider_i, tools, mem_opt, obs, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
     session_mgr.policy = &sec_policy;
+    if (mem_rt) |*rt| {
+        session_mgr.mem_rt = rt;
+    }
     defer session_mgr.deinit();
 
     var evict_counter: u32 = 0;
@@ -1392,9 +1910,10 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
             const reply = session_mgr.processMessage(session_key, msg.content) catch |err| {
                 std.debug.print("  Agent error: {}\n", .{err});
                 const err_msg = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError => "Network error. Please try again.",
+                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
                     error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
                     error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
+                    error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
                     error.OutOfMemory => "Out of memory.",
                     else => "An error occurred. Try again or /new for a fresh session.",
                 };
@@ -1777,7 +2296,6 @@ fn printUsage() void {
         \\  onboard     Initialize workspace and configuration
         \\  agent       Start the AI agent loop
         \\  gateway     Start the gateway server (HTTP/WebSocket)
-        \\  daemon      Start long-running runtime (gateway + channels + heartbeat)
         \\  service     Manage OS service lifecycle (install/start/stop/status/uninstall)
         \\  status      Show system status
         \\  version     Show CLI version
@@ -1787,6 +2305,8 @@ fn printUsage() void {
         \\  skills      Manage skills
         \\  hardware    Discover and manage hardware
         \\  migrate     Migrate data from other agent runtimes
+        \\  memory      Inspect and maintain memory subsystem
+        \\  capabilities Show runtime capabilities manifest
         \\  models      Manage provider model catalogs
         \\  auth        Manage OAuth authentication (OpenAI Codex)
         \\  update      Check for and install updates
@@ -1796,14 +2316,15 @@ fn printUsage() void {
         \\  onboard [--interactive] [--api-key KEY] [--provider PROV] [--memory MEM]
         \\  agent [-m MESSAGE] [-s SESSION] [--provider PROVIDER] [--model MODEL] [--temperature TEMP]
         \\  gateway [--port PORT] [--host HOST]
-        \\  daemon [--port PORT] [--host HOST]
         \\  version | --version | -V
         \\  service <install|start|stop|status|uninstall>
         \\  cron <list|add|once|remove|pause|resume> [ARGS]
-        \\  channel <list|start|doctor|add|remove> [ARGS]
+        \\  channel <list|start|status|add|remove> [ARGS]
         \\  skills <list|install|remove> [ARGS]
         \\  hardware <discover|introspect|info> [ARGS]
         \\  migrate openclaw [--dry-run] [--source PATH]
+        \\  memory <stats|count|reindex|search|get|list|drain-outbox|forget> [ARGS]
+        \\  capabilities [--json]
         \\  models refresh
         \\  auth <login|status|logout> <provider> [--import-codex]
         \\  update [--check] [--yes]
@@ -1820,10 +2341,79 @@ test "parse known commands" {
     try std.testing.expectEqual(.version, parseCommand("-V").?);
     try std.testing.expectEqual(.service, parseCommand("service").?);
     try std.testing.expectEqual(.migrate, parseCommand("migrate").?);
+    try std.testing.expectEqual(.memory, parseCommand("memory").?);
+    try std.testing.expectEqual(.capabilities, parseCommand("capabilities").?);
     try std.testing.expectEqual(.models, parseCommand("models").?);
     try std.testing.expectEqual(.auth, parseCommand("auth").?);
     try std.testing.expectEqual(.update, parseCommand("update").?);
+    try std.testing.expect(parseCommand("daemon") == null);
     try std.testing.expect(parseCommand("unknown") == null);
+}
+
+test "parsePositiveUsize accepts only positive integers" {
+    try std.testing.expectEqual(@as(?usize, 1), parsePositiveUsize("1"));
+    try std.testing.expectEqual(@as(?usize, 42), parsePositiveUsize("42"));
+    try std.testing.expect(parsePositiveUsize("0") == null);
+    try std.testing.expect(parsePositiveUsize("-1") == null);
+    try std.testing.expect(parsePositiveUsize("bad") == null);
+}
+
+test "parseOnboardArgs parses quick setup flags" {
+    const args = [_][]const u8{ "--api-key", "sk-test", "--provider", "openrouter", "--memory", "markdown" };
+    switch (parseOnboardArgs(&args)) {
+        .ok => |parsed| {
+            try std.testing.expectEqual(OnboardMode.quick, parsed.mode);
+            try std.testing.expectEqualStrings("sk-test", parsed.api_key.?);
+            try std.testing.expectEqualStrings("openrouter", parsed.provider.?);
+            try std.testing.expectEqualStrings("markdown", parsed.memory_backend.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseOnboardArgs parses interactive mode" {
+    const args = [_][]const u8{"--interactive"};
+    switch (parseOnboardArgs(&args)) {
+        .ok => |parsed| {
+            try std.testing.expectEqual(OnboardMode.interactive, parsed.mode);
+            try std.testing.expect(parsed.api_key == null);
+            try std.testing.expect(parsed.provider == null);
+            try std.testing.expect(parsed.memory_backend == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseOnboardArgs reports unknown option" {
+    const args = [_][]const u8{"--not-real"};
+    switch (parseOnboardArgs(&args)) {
+        .unknown_option => |opt| try std.testing.expectEqualStrings("--not-real", opt),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseOnboardArgs reports missing option value" {
+    const args = [_][]const u8{"--provider"};
+    switch (parseOnboardArgs(&args)) {
+        .missing_value => |opt| try std.testing.expectEqualStrings("--provider", opt),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseOnboardArgs rejects mixed interactive and quick flags" {
+    const args = [_][]const u8{ "--interactive", "--provider", "openrouter" };
+    switch (parseOnboardArgs(&args)) {
+        .invalid_combination => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseOnboardArgs rejects positional arguments" {
+    const args = [_][]const u8{"extra"};
+    switch (parseOnboardArgs(&args)) {
+        .unexpected_argument => |arg| try std.testing.expectEqualStrings("extra", arg),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "applyGatewayDaemonOverrides applies CLI port before validation" {
@@ -1893,5 +2483,22 @@ test "hasConfiguredStartableChannels returns true when telegram configured" {
         },
     };
 
+    if (!yc.channel_catalog.isBuildEnabled(.telegram)) return error.SkipZigTest;
     try std.testing.expect(hasConfiguredStartableChannels(&cfg));
+}
+
+test "hasConfiguredButBuildDisabledStartableChannels detects configured disabled channel" {
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_model = "openrouter/auto",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .telegram = &[_]yc.config.TelegramConfig{
+                .{ .account_id = "main", .bot_token = "123:abc" },
+            },
+        },
+    };
+
+    try std.testing.expectEqual(!yc.channel_catalog.isBuildEnabled(.telegram), hasConfiguredButBuildDisabledStartableChannels(&cfg));
 }

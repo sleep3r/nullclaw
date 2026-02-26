@@ -478,7 +478,7 @@ test "aieosToSystemPrompt no sections" {
 test "isAieosConfigured" {
     try std.testing.expect(isAieosConfigured("aieos", "identity.json", null));
     try std.testing.expect(isAieosConfigured("aieos", null, "{\"identity\":{}}"));
-    try std.testing.expect(!isAieosConfigured("openclaw", "identity.json", null));
+    try std.testing.expect(!isAieosConfigured("legacy", "identity.json", null));
     try std.testing.expect(!isAieosConfigured("aieos", null, null));
 }
 

@@ -16,6 +16,7 @@ const mcp = @import("mcp.zig");
 const voice = @import("voice.zig");
 const health = @import("health.zig");
 const daemon = @import("daemon.zig");
+const subagent_mod = @import("subagent.zig");
 const agent_routing = @import("agent_routing.zig");
 const provider_runtime = @import("providers/runtime_bundle.zig");
 
@@ -71,8 +72,9 @@ pub const ChannelRuntime = struct {
     session_mgr: session_mod.SessionManager,
     provider_bundle: provider_runtime.RuntimeProviderBundle,
     tools: []const tools_mod.Tool,
-    mem: ?memory_mod.Memory,
+    mem_rt: ?memory_mod.MemoryRuntime,
     noop_obs: *observability.NoopObserver,
+    subagent_manager: ?*subagent_mod.SubagentManager,
 
     /// Initialize the runtime from config — mirrors main.zig:702-786 setup.
     pub fn init(allocator: std.mem.Allocator, config: *const Config) !*ChannelRuntime {
@@ -92,6 +94,15 @@ pub const ChannelRuntime = struct {
             null;
         defer if (mcp_tools) |mt| allocator.free(mt);
 
+        const subagent_manager = allocator.create(subagent_mod.SubagentManager) catch null;
+        errdefer if (subagent_manager) |mgr| allocator.destroy(mgr);
+        if (subagent_manager) |mgr| {
+            mgr.* = subagent_mod.SubagentManager.init(allocator, config, null, .{});
+            errdefer {
+                mgr.deinit();
+            }
+        }
+
         // Tools
         const tools = tools_mod.allTools(allocator, config.workspace_dir, .{
             .http_enabled = config.http_request.enabled,
@@ -101,19 +112,14 @@ pub const ChannelRuntime = struct {
             .agents = config.agents,
             .fallback_api_key = resolved_key,
             .tools_config = config.tools,
+            .subagent_manager = subagent_manager,
         }) catch &.{};
         errdefer if (tools.len > 0) tools_mod.deinitTools(allocator, tools);
 
         // Optional memory backend
-        var mem_opt: ?memory_mod.Memory = null;
-        const db_path = std.fs.path.joinZ(allocator, &.{ config.workspace_dir, "memory.db" }) catch null;
-        defer if (db_path) |p| allocator.free(p);
-        if (db_path) |p| {
-            if (memory_mod.createMemory(allocator, config.memory.backend, p)) |mem| {
-                mem_opt = mem;
-            } else |_| {}
-        }
-        errdefer if (mem_opt) |m| m.deinit();
+        var mem_rt = memory_mod.initRuntime(allocator, &config.memory, config.workspace_dir);
+        errdefer if (mem_rt) |*rt| rt.deinit();
+        const mem_opt: ?memory_mod.Memory = if (mem_rt) |rt| rt.memory else null;
 
         // Noop observer (heap for vtable stability)
         const noop_obs = try allocator.create(observability.NoopObserver);
@@ -122,7 +128,7 @@ pub const ChannelRuntime = struct {
         const obs = noop_obs.observer();
 
         // Session manager
-        const session_mgr = session_mod.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs);
+        const session_mgr = session_mod.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
 
         // Self — heap-allocated so pointers remain stable
         const self = try allocator.create(ChannelRuntime);
@@ -132,9 +138,17 @@ pub const ChannelRuntime = struct {
             .session_mgr = session_mgr,
             .provider_bundle = runtime_provider,
             .tools = tools,
-            .mem = mem_opt,
+            .mem_rt = mem_rt,
             .noop_obs = noop_obs,
+            .subagent_manager = subagent_manager,
         };
+        // Wire MemoryRuntime pointer into SessionManager for /doctor diagnostics
+        // and into memory tools for retrieval pipeline + vector sync.
+        // self is heap-allocated so the pointer is stable.
+        if (self.mem_rt) |*rt| {
+            self.session_mgr.mem_rt = rt;
+            tools_mod.bindMemoryRuntime(tools, rt);
+        }
         return self;
     }
 
@@ -142,7 +156,11 @@ pub const ChannelRuntime = struct {
         const alloc = self.allocator;
         self.session_mgr.deinit();
         if (self.tools.len > 0) tools_mod.deinitTools(alloc, self.tools);
-        if (self.mem) |m| m.deinit();
+        if (self.subagent_manager) |mgr| {
+            mgr.deinit();
+            alloc.destroy(mgr);
+        }
+        if (self.mem_rt) |*rt| rt.deinit();
         self.provider_bundle.deinit();
         alloc.destroy(self.noop_obs);
         alloc.destroy(self);
@@ -245,9 +263,10 @@ pub fn runTelegramLoop(
             const reply = runtime.session_mgr.processMessage(session_key, msg.content) catch |err| {
                 log.err("Agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError => "Network error. Please try again.",
+                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
                     error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
                     error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
+                    error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
                     error.OutOfMemory => "Out of memory.",
                     else => "An error occurred. Try again or /new for a fresh session.",
                 };
@@ -364,9 +383,10 @@ pub fn runSignalLoop(
             const reply = runtime.session_mgr.processMessage(session_key, msg.content) catch |err| {
                 log.err("Signal agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError => "Network error. Please try again.",
+                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
                     error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
                     error.NoResponseContent => "Model returned an empty response. Please try again.",
+                    error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
                     error.OutOfMemory => "Out of memory.",
                     else => "An error occurred. Try again.",
                 };
@@ -564,9 +584,10 @@ pub fn runMatrixLoop(
             const reply = runtime.session_mgr.processMessage(session_key, msg.content) catch |err| {
                 log.err("Matrix agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError => "Network error. Please try again.",
+                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
                     error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
                     error.NoResponseContent => "Model returned an empty response. Please try again.",
+                    error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
                     error.OutOfMemory => "Out of memory.",
                     else => "An error occurred. Try again.",
                 };

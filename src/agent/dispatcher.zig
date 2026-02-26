@@ -175,6 +175,7 @@ pub fn buildToolInstructions(allocator: std.mem.Allocator, tools: anytype) ![]co
     try w.writeAll("You may use multiple tool calls in a single response. ");
     try w.writeAll("After tool execution, results appear in <tool_result> tags. ");
     try w.writeAll("Continue reasoning with the results until you can give a final answer.\n\n");
+    try w.writeAll("Prefer memory tools (memory_recall, memory_list, memory_store, memory_forget) for assistant memory tasks instead of shell/sqlite commands.\n\n");
     try w.writeAll("### Available Tools\n\n");
 
     for (tools) |t| {

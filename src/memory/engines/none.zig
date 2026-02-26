@@ -4,7 +4,7 @@
 //! while keeping the runtime wiring stable.
 
 const std = @import("std");
-const root = @import("root.zig");
+const root = @import("../root.zig");
 const Memory = root.Memory;
 const MemoryCategory = root.MemoryCategory;
 const MemoryEntry = root.MemoryEntry;

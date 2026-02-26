@@ -10,7 +10,7 @@
 //! Mirrors ZeroClaw's `LucidMemory` (src/memory/lucid.rs).
 
 const std = @import("std");
-const root = @import("root.zig");
+const root = @import("../root.zig");
 const Memory = root.Memory;
 const MemoryCategory = root.MemoryCategory;
 const MemoryEntry = root.MemoryEntry;
@@ -149,7 +149,7 @@ pub const LucidMemory = struct {
 
         var child = std.process.Child.init(argv_buf, self.allocator);
         child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Pipe;
+        child.stderr_behavior = .Ignore;
 
         child.spawn() catch return null;
 
@@ -306,10 +306,29 @@ pub const LucidMemory = struct {
             return allocator.alloc(MemoryEntry, 0);
         }
 
+        const batches = [2][]MemoryEntry{ primary, secondary };
+        var batch_idx: usize = 0;
+        var entry_idx: usize = 0;
+
         var merged: std.ArrayList(MemoryEntry) = .empty;
         errdefer {
             for (merged.items) |*e| e.deinit(allocator);
             merged.deinit(allocator);
+            // Free remaining unprocessed entries from current and subsequent batches.
+            // On error mid-iteration, entries already appended to `merged` are freed above,
+            // but entries not yet visited would leak without this cleanup.
+            var bi = batch_idx;
+            var ei = entry_idx;
+            while (bi < batches.len) {
+                while (ei < batches[bi].len) {
+                    var e = batches[bi][ei];
+                    e.deinit(allocator);
+                    ei += 1;
+                }
+                allocator.free(batches[bi]);
+                bi += 1;
+                ei = 0;
+            }
         }
 
         // Track seen keys by lowered signature (key + '\0' + content)
@@ -321,8 +340,12 @@ pub const LucidMemory = struct {
         }
 
         // Process primary first, then secondary
-        for ([_][]MemoryEntry{ primary, secondary }) |batch| {
-            for (batch) |entry| {
+        while (batch_idx < batches.len) {
+            entry_idx = 0;
+            while (entry_idx < batches[batch_idx].len) {
+                const entry = batches[batch_idx][entry_idx];
+                entry_idx += 1; // advance past this entry (now "processed")
+
                 if (merged.items.len >= limit) {
                     // Free remaining entries from this batch that won't be used
                     var e_copy = entry;
@@ -342,7 +365,8 @@ pub const LucidMemory = struct {
                 }
             }
             // Free the batch slice itself (but not entries — they're moved)
-            allocator.free(batch);
+            allocator.free(batches[batch_idx]);
+            batch_idx += 1;
         }
 
         return merged.toOwnedSlice(allocator);
@@ -467,6 +491,39 @@ pub const LucidMemory = struct {
             .ptr = @ptrCast(self),
             .vtable = &vtable,
         };
+    }
+
+    // ── SessionStore vtable ────────────────────────────────────────
+
+    fn implSessionSaveMessage(ptr: *anyopaque, session_id: []const u8, role: []const u8, content: []const u8) anyerror!void {
+        const self = castSelf(ptr);
+        return self.local.saveMessage(session_id, role, content);
+    }
+
+    fn implSessionLoadMessages(ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8) anyerror![]root.MessageEntry {
+        const self = castSelf(ptr);
+        return self.local.loadMessages(allocator, session_id);
+    }
+
+    fn implSessionClearMessages(ptr: *anyopaque, session_id: []const u8) anyerror!void {
+        const self = castSelf(ptr);
+        return self.local.clearMessages(session_id);
+    }
+
+    fn implSessionClearAutoSaved(ptr: *anyopaque, session_id: ?[]const u8) anyerror!void {
+        const self = castSelf(ptr);
+        return self.local.clearAutoSaved(session_id);
+    }
+
+    const session_vtable = root.SessionStore.VTable{
+        .saveMessage = &implSessionSaveMessage,
+        .loadMessages = &implSessionLoadMessages,
+        .clearMessages = &implSessionClearMessages,
+        .clearAutoSaved = &implSessionClearAutoSaved,
+    };
+
+    pub fn sessionStore(self: *Self) root.SessionStore {
+        return .{ .ptr = @ptrCast(self), .vtable = &session_vtable };
     }
 };
 
@@ -853,4 +910,50 @@ test "lucid list accepts session_id" {
     const results = try m.list(allocator, null, "session-abc");
     defer root.freeEntries(allocator, results);
     try std.testing.expect(results.len >= 1);
+}
+
+// ── SessionStore vtable tests ─────────────────────────────────────
+
+test "lucid sessionStore returns valid vtable" {
+    const allocator = std.testing.allocator;
+    var mem = try LucidMemory.initWithOptions(
+        allocator,
+        ":memory:",
+        "nonexistent-lucid-binary",
+        "/tmp/test",
+        200,
+        3,
+        2000,
+    );
+    defer mem.deinit();
+
+    const store = mem.sessionStore();
+    try std.testing.expect(store.vtable == &LucidMemory.session_vtable);
+}
+
+test "lucid sessionStore saveMessage + loadMessages roundtrip" {
+    const allocator = std.testing.allocator;
+    var mem = try LucidMemory.initWithOptions(
+        allocator,
+        ":memory:",
+        "nonexistent-lucid-binary",
+        "/tmp/test",
+        200,
+        3,
+        2000,
+    );
+    defer mem.deinit();
+
+    const store = mem.sessionStore();
+    try store.saveMessage("s1", "user", "hello from lucid");
+    try store.saveMessage("s1", "assistant", "hi back");
+
+    const msgs = try store.loadMessages(allocator, "s1");
+    defer root.freeMessages(allocator, msgs);
+
+    try std.testing.expectEqual(@as(usize, 2), msgs.len);
+    try std.testing.expectEqualStrings("user", msgs[0].role);
+    try std.testing.expectEqualStrings("hello from lucid", msgs[0].content);
+    try std.testing.expectEqualStrings("assistant", msgs[1].role);
+    try std.testing.expectEqualStrings("hi back", msgs[1].content);
 }
