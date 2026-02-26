@@ -403,7 +403,7 @@ pub const GeminiProvider = struct {
 
     /// Run curl in SSE streaming mode for Gemini and parse output line by line.
     ///
-    /// Spawns `curl -s --no-buffer` and reads stdout incrementally.
+    /// Spawns `curl -s --no-buffer --fail-with-body` and reads stdout incrementally.
     /// For each SSE delta, calls `callback(ctx, chunk)`.
     /// Returns accumulated result after stream completes.
     /// Stream ends when curl connection closes (no [DONE] sentinel).
@@ -412,6 +412,7 @@ pub const GeminiProvider = struct {
         url: []const u8,
         body: []const u8,
         headers: []const []const u8,
+        timeout_secs: u64,
         callback: root.StreamCallback,
         ctx: *anyopaque,
     ) !root.StreamChatResult {
@@ -425,6 +426,18 @@ pub const GeminiProvider = struct {
         argc += 1;
         argv_buf[argc] = "--no-buffer";
         argc += 1;
+        argv_buf[argc] = "--fail-with-body";
+        argc += 1;
+
+        var timeout_buf: [32]u8 = undefined;
+        if (timeout_secs > 0) {
+            const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch return error.GeminiApiError;
+            argv_buf[argc] = "--max-time";
+            argc += 1;
+            argv_buf[argc] = timeout_str;
+            argc += 1;
+        }
+
         argv_buf[argc] = "-X";
         argc += 1;
         argv_buf[argc] = "POST";
@@ -490,8 +503,22 @@ pub const GeminiProvider = struct {
             }
         }
 
-        // Send final chunk
-        callback(ctx, root.StreamChunk.finalChunk());
+        // Parse trailing line if stream ended without final newline.
+        if (line_buf.items.len > 0) {
+            const trailing = parseGeminiSseLine(allocator, line_buf.items) catch null;
+            line_buf.clearRetainingCapacity();
+            if (trailing) |result| {
+                switch (result) {
+                    .delta => |text| {
+                        defer allocator.free(text);
+                        try accumulated.appendSlice(allocator, text);
+                        callback(ctx, root.StreamChunk.textDelta(text));
+                    },
+                    .done => {},
+                    .skip => {},
+                }
+            }
+        }
 
         // Drain remaining stdout to prevent deadlock on wait()
         while (true) {
@@ -504,6 +531,9 @@ pub const GeminiProvider = struct {
             .Exited => |code| if (code != 0) return error.CurlFailed,
             else => return error.CurlFailed,
         }
+
+        // Signal completion only after successful process exit.
+        callback(ctx, root.StreamChunk.finalChunk());
 
         const content = if (accumulated.items.len > 0)
             try allocator.dupe(u8, accumulated.items)
@@ -631,12 +661,12 @@ pub const GeminiProvider = struct {
         defer allocator.free(body);
 
         if (auth.isApiKey()) {
-            return curlStreamGemini(allocator, url, body, &.{}, callback, callback_ctx);
+            return curlStreamGemini(allocator, url, body, &.{}, request.timeout_secs, callback, callback_ctx);
         } else {
             var auth_hdr_buf: [512]u8 = undefined;
             const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{auth.credential()}) catch return error.GeminiApiError;
             const headers = [_][]const u8{auth_hdr};
-            return curlStreamGemini(allocator, url, body, &headers, callback, callback_ctx);
+            return curlStreamGemini(allocator, url, body, &headers, request.timeout_secs, callback, callback_ctx);
         }
     }
 };
@@ -947,6 +977,13 @@ test "parseGeminiSseLine valid delta" {
 test "parseGeminiSseLine empty line" {
     const result = try GeminiProvider.parseGeminiSseLine(std.testing.allocator, "");
     try std.testing.expect(result == .skip);
+}
+
+test "parseGeminiSseLine invalid json returns error" {
+    try std.testing.expectError(
+        error.InvalidSseJson,
+        GeminiProvider.parseGeminiSseLine(std.testing.allocator, "data: not-json"),
+    );
 }
 
 test "streamChatImpl fails without credentials" {
